@@ -19,8 +19,8 @@
 适用于：
 
 - 留学 / 海外工作场景
-- 国内 SIM 卡留在家中
-- 远程接收短信验证码
+- iphone留在家中
+- 远程接收短信验证码/通知
 - 全量通知同步
 
 ---
@@ -48,7 +48,7 @@ Windows 端模拟类似 Apple Watch 的行为，
 
 你需要在 iPhone 上安装：
 
-> **LightBlue® — Bluetooth Low Energy**
+> **LightBlue® — Bluetooth Low Energy**并选择virtual service，添加一个heartrate设备
 
 用途：
 
@@ -108,14 +108,6 @@ Windows 端模拟类似 Apple Watch 的行为，
 
 ---
 
-## 🔑 验证码识别
-
-支持自动识别：
-
-- 4–8 位数字验证码
-- 可单独推送
-
----
 
 ## 🛡 安全说明
 
@@ -141,7 +133,7 @@ It forwards notifications to:
 Designed for:
 
 - Studying / working abroad
-- Leaving a SIM card phone at home
+- Leaving a iphone at home
 - Remote verification code reception
 - Full notification forwarding
 
@@ -165,7 +157,7 @@ Windows acts similarly to an Apple Watch subscribing to system notifications.
 
 Required app:
 
-> **LightBlue® — Bluetooth Low Energy**
+> **LightBlue® — Bluetooth Low Energy** and slect virtual service and add a heart rate
 
 Purpose:
 
@@ -218,13 +210,6 @@ Click:
 START
 
 Trigger an iPhone notification to test.
-
----
-
-## 🔐 Verification Code Detection
-
-- Detects 4–8 digit codes
-- Optional separate push
 
 ---
 
