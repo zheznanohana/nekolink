@@ -29,13 +29,12 @@ except Exception:
 # -----------------------------
 # UUIDs
 # -----------------------------
-# ANCS UUIDs
 ANCS_SERVICE = "7905f431-b5ce-4e99-a40f-4b1e122d00d0"
 NOTIF_SRC = "9fbf120d-6301-42d9-8c58-25e699a21dbd"
 CTRL_PT = "69d1d8f3-45e1-49a8-9821-9bbdfdaad9d9"
 DATA_SRC = "22eac6e9-24d6-4bb5-be44-b36ace7c7bfb"
 
-# Battery Level characteristic
+# Standard Battery Level characteristic
 BATTERY_LEVEL_CHAR = "00002a19-0000-1000-8000-00805f9b34fb"
 
 # ANCS Attribute IDs
@@ -50,7 +49,6 @@ ATTR_DATE = 5
 # Config location (portable-first, AppData fallback)
 # -----------------------------
 def _base_dir() -> Path:
-    # script dir (py) or exe dir (pyinstaller)
     try:
         import sys
 
@@ -75,9 +73,9 @@ def _is_writable_dir(p: Path) -> bool:
 def get_config_path() -> str:
     """
     Rules:
-      1) If config.json exists next to exe/script -> use it (portable, easy to view/edit)
-      2) If dir not writable -> fallback to %APPDATA%\\NekoLink\\config.json (stable)
-      3) You can set env NEKOLINK_PORTABLE=1 to force portable mode
+      1) If config.json exists next to exe/script -> use it (portable)
+      2) If dir not writable -> fallback to %APPDATA%\\NekoLink\\config.json
+      3) Env NEKOLINK_PORTABLE=1 forces portable mode
     """
     base = _base_dir()
     portable = base / "config.json"
@@ -134,8 +132,8 @@ class BridgeConfig:
 
     # dingtalk
     enable_dingtalk: bool = False
-    dingtalk_webhook: str = ""
-    dingtalk_secret: str = ""  # optional
+    dingtalk_webhook: str = ""  # must include access_token=xxx
+    dingtalk_secret: str = ""   # if enabled signing in DingTalk robot
 
     # behavior
     dedup_seconds: int = 8
@@ -156,7 +154,7 @@ class BridgeConfig:
     # autostart
     autostart_enabled: bool = False
 
-    # --- Misc (NEW) ---
+    # misc
     show_battery_in_message: bool = True
     enable_windows_toast: bool = True
 
@@ -182,14 +180,14 @@ def send_email(cfg: BridgeConfig, subject: str, body: str):
     if not cfg.smtp_host or not cfg.smtp_user or not cfg.smtp_pass:
         raise ValueError("Missing SMTP settings")
     if not cfg.email_to or not cfg.email_from:
-        raise ValueError("Missing email to/from")
+        raise ValueError("Missing email_to/email_from")
 
     msg = MIMEText(body, _charset="utf-8")
     msg["Subject"] = subject
     msg["From"] = cfg.email_from
     msg["To"] = cfg.email_to
 
-    server = smtplib.SMTP(cfg.smtp_host, int(cfg.smtp_port), timeout=12)
+    server = smtplib.SMTP(cfg.smtp_host, int(cfg.smtp_port), timeout=10)
     server.ehlo()
     server.starttls()
     server.login(cfg.smtp_user, cfg.smtp_pass)
@@ -198,417 +196,525 @@ def send_email(cfg: BridgeConfig, subject: str, body: str):
 
 
 def _dingtalk_signed_url(webhook: str, secret: str) -> str:
-    ts = str(round(time.time() * 1000))
-    string_to_sign = f"{ts}\n{secret}"
-    digest = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).digest()
-    sign = urllib.parse.quote_plus(base64.b64encode(digest))
-    joiner = "&" if ("?" in webhook) else "?"
-    return f"{webhook}{joiner}timestamp={ts}&sign={sign}"
+    """
+    DingTalk signing:
+      timestamp = ms
+      string_to_sign = f"{timestamp}\n{secret}"
+      sign = urlencode(base64(hmac_sha256(secret, string_to_sign)))
+      url = webhook + "&timestamp=...&sign=..."
+    If secret empty -> no sign mode.
+    """
+    webhook = (webhook or "").strip()
+    if not webhook:
+        raise ValueError("Missing DingTalk webhook")
+
+    secret = (secret or "").strip()
+    if not secret:
+        return webhook
+
+    timestamp = str(int(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+
+    hmac_code = hmac.new(
+        secret.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+
+    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+    return f"{webhook}&timestamp={timestamp}&sign={sign}"
 
 
 def send_dingtalk_text(webhook: str, secret: str, text: str, timeout: int = 10):
-    if not webhook:
-        raise ValueError("Missing DingTalk webhook")
-    url = _dingtalk_signed_url(webhook, secret) if secret else webhook
-    payload = {"msgtype": "text", "text": {"content": text}}
-    r = requests.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    j = r.json()
-    if isinstance(j, dict) and j.get("errcode", 0) != 0:
-        raise RuntimeError(f"DingTalk error: {j}")
+    """
+    Robust DingTalk send:
+      - Works in both no-sign and sign-enabled mode
+      - Treat errcode!=0 as failure
+    """
+    url = _dingtalk_signed_url(webhook, secret)
+    data = {"msgtype": "text", "text": {"content": text}}
+    r = requests.post(url, json=data, timeout=timeout)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"Bad response: {r.text}")
+
+    if j.get("errcode", 0) != 0:
+        raise RuntimeError(str(j))
 
 
 # -----------------------------
-# ANCS helpers
+# Helpers
 # -----------------------------
-def build_get_notification_attributes(uid: int) -> bytes:
-    """
-    CommandID(0x00) + UID(LE 4)
-    Attributes: AppId, Title(64), Subtitle(64), Message(256), Date
-    """
-    b = bytearray()
-    b += b"\x00"
-    b += uid.to_bytes(4, "little")
-
-    b += bytes([ATTR_APP_IDENTIFIER])
-
-    b += bytes([ATTR_TITLE])
-    b += (64).to_bytes(2, "little")
-
-    b += bytes([ATTR_SUBTITLE])
-    b += (64).to_bytes(2, "little")
-
-    b += bytes([ATTR_MESSAGE])
-    b += (256).to_bytes(2, "little")
-
-    b += bytes([ATTR_DATE])
-    return bytes(b)
+def _now_ts() -> float:
+    return time.time()
 
 
-def _try_parse_ds(buffer: bytearray):
-    if len(buffer) < 5:
-        return None
-    cmd_id = buffer[0]
-    uid = int.from_bytes(buffer[1:5], "little")
-    i = 5
-    attrs: Dict[int, str] = {}
-    while True:
-        if i == len(buffer):
-            return cmd_id, uid, attrs, i
-        if i + 3 > len(buffer):
-            return None
-        attr_id = buffer[i]
-        attr_len = int.from_bytes(buffer[i + 1 : i + 3], "little")
-        i += 3
-        if i + attr_len > len(buffer):
-            return None
-        raw = bytes(buffer[i : i + attr_len])
-        i += attr_len
-        attrs[attr_id] = raw.decode("utf-8", errors="replace")
-
-
-def _contains_block(hay: str, keywords: List[str], ci: bool) -> bool:
-    kws = [k for k in (keywords or []) if k.strip()]
-    if not kws:
+def _contains_block_keyword(text: str, keywords: List[str], case_insensitive: bool) -> bool:
+    if not keywords:
         return False
-    if ci:
-        hay = (hay or "").lower()
-        kws = [k.lower() for k in kws]
-    return any(k in hay for k in kws)
+    hay = text or ""
+    if case_insensitive:
+        hay = hay.lower()
+        kws = [k.lower() for k in keywords if k]
+    else:
+        kws = [k for k in keywords if k]
+    for k in kws:
+        if k and k in hay:
+            return True
+    return False
+
+
+def _extract_codes(text: str, regex: str) -> List[str]:
+    try:
+        return re.findall(regex, text or "")
+    except Exception:
+        return []
+
+
+def _format_message(payload: dict, cfg: BridgeConfig) -> str:
+    # main text
+    lines = []
+    lines.append("📲 iPhone 通知")
+    if payload.get("device"):
+        lines.append(f"Device: {payload.get('device')}")
+    if cfg.show_battery_in_message:
+        bat = payload.get("battery")
+        if isinstance(bat, int):
+            lines.append(f"Battery: {bat}%")
+    if payload.get("app"):
+        lines.append(f"App: {payload.get('app')}")
+    if payload.get("title"):
+        lines.append(f"Title: {payload.get('title')}")
+    if payload.get("msg"):
+        lines.append(f"Msg: {payload.get('msg')}")
+    if payload.get("date"):
+        lines.append(f"Date: {payload.get('date')}")
+    return "\n".join(lines)
 
 
 # -----------------------------
-# Single device bridge
+# ANCS Session
 # -----------------------------
-class SingleDeviceBridge:
-    """
-    One BLE connection -> ANCS -> callbacks
-    Additionally subscribes Battery Level and caches latest percentage.
-    """
-
+class _ANCSSession:
     def __init__(
         self,
+        addr: str,
         cfg: BridgeConfig,
-        address: str,
         log: Callable[[str], None],
-        on_notification: Callable[[dict], None],
+        on_payload: Callable[[dict], None],
     ):
+        self.addr = addr
         self.cfg = cfg
-        self.address = address
         self.log = log
-        self.on_notification = on_notification
+        self.on_payload = on_payload
 
-        self._stop_evt = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._client: Optional[BleakClient] = None
+        self.client: Optional[BleakClient] = None
+        self._stop = asyncio.Event()
 
-        self._pending_uid: Optional[int] = None
-        self._ds_buffer = bytearray()
-        self._last_sent: Dict[Tuple[str, str, str], float] = {}
+        # buffers
+        self._ds_buf: bytearray = bytearray()
+        self._await_uid: Optional[int] = None
+        self._last_battery_read: float = 0.0
+        self._battery_cache: Optional[int] = None
 
-        self._code_re = re.compile(self.cfg.code_regex)
-        self.latest_battery: Optional[int] = None  # cached battery %
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_evt.set()
-        if self._loop:
-            try:
-                asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
-            except Exception:
-                pass
-
-    def _run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+    async def stop(self):
+        self._stop.set()
         try:
-            self._loop.run_until_complete(self._main_reconnect_loop())
-        except Exception as e:
-            self.log(f"[{self.address}] [FATAL] {e}")
-        finally:
-            try:
-                self._loop.stop()
-                self._loop.close()
-            except Exception:
-                pass
-            self.log(f"[{self.address}] stopped")
-
-    async def _disconnect(self):
-        if self._client:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-
-    async def _main_reconnect_loop(self):
-        backoff = 2
-        while not self._stop_evt.is_set():
-            try:
-                await self._connect_and_run()
-                backoff = 2
-            except Exception as e:
-                self.log(f"[{self.address}] [RETRY] {e}")
-            await self._disconnect()
-            if self._stop_evt.is_set():
-                break
-            self.log(f"[{self.address}] reconnect in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(30, backoff * 2)
-
-    async def _connect_and_run(self):
-        self._pending_uid = None
-        self._ds_buffer = bytearray()
-
-        self.log(f"[{self.address}] connecting ...")
-        self._client = BleakClient(
-            self.address,
-            timeout=30,
-            winrt={"use_cached_services": False},
-            disconnected_callback=lambda _c: self.log(f"[{self.address}] disconnected"),
-        )
-        await self._client.connect()
-        self.log(f"[{self.address}] connected")
-
-        # ANCS
-        await self._client.start_notify(DATA_SRC, self._on_data_src)
-        await self._client.start_notify(NOTIF_SRC, self._on_notif_src)
-        self.log(f"[{self.address}] subscribed ANCS")
-
-        # Battery (read once + subscribe)
-        await self._setup_battery()
-
-        while not self._stop_evt.is_set() and self._client.is_connected:
-            await asyncio.sleep(0.2)
-
-    async def _setup_battery(self):
-        if not self._client:
-            return
-        # read once
-        try:
-            raw = await self._client.read_gatt_char(BATTERY_LEVEL_CHAR)
-            if raw and len(raw) >= 1:
-                self.latest_battery = int(raw[0])
-                self.log(f"[{self.address}] battery={self.latest_battery}% (read)")
-        except Exception as e:
-            self.log(f"[{self.address}] battery read fail: {e}")
-
-        # notify
-        try:
-            await self._client.start_notify(BATTERY_LEVEL_CHAR, self._on_battery)
-            self.log(f"[{self.address}] battery notify on")
-        except Exception as e:
-            self.log(f"[{self.address}] battery notify fail: {e}")
-
-    def _on_battery(self, _sender: str, data: bytearray):
-        try:
-            if data and len(data) >= 1:
-                self.latest_battery = int(data[0])
+            if self.client and self.client.is_connected:
+                await self.client.disconnect()
         except Exception:
             pass
 
-    def _extract_codes(self, msg: str) -> List[str]:
-        if not self.cfg.enable_code_highlight:
-            return []
-        if not msg:
-            return []
-        return list(dict.fromkeys(self._code_re.findall(msg)))
-
-    def _on_notif_src(self, _sender: str, data: bytearray):
-        if len(data) < 8:
-            return
-        event_id = data[0]
-        uid = int.from_bytes(data[4:8], "little")
-        if event_id != 0:
-            return
-        if self._loop and self._client:
-            asyncio.run_coroutine_threadsafe(self._request_details(uid), self._loop)
-
-    async def _request_details(self, uid: int):
-        if not self._client:
-            return
-        self._pending_uid = uid
-        cmd = build_get_notification_attributes(uid)
-        try:
-            await self._client.write_gatt_char(CTRL_PT, cmd, response=True)
-        except Exception as e:
-            self.log(f"[{self.address}] [CP] failed: {e}")
-
-    def _on_data_src(self, _sender: str, data: bytearray):
-        self._ds_buffer.extend(data)
-        parsed = _try_parse_ds(self._ds_buffer)
-        if not parsed:
-            return
-        _cmd_id, uid, attrs, used = parsed
-        self._ds_buffer = self._ds_buffer[used:]
-
-        if self._pending_uid is not None and uid != self._pending_uid:
-            return
-
-        app_id = attrs.get(ATTR_APP_IDENTIFIER, "") or ""
-        title = attrs.get(ATTR_TITLE, "") or ""
-        subtitle = attrs.get(ATTR_SUBTITLE, "") or ""
-        msg = attrs.get(ATTR_MESSAGE, "") or ""
-        date = attrs.get(ATTR_DATE, "") or ""
-
-        # dedup
-        key = (app_id, title, msg)
-        now = time.time()
-        last = self._last_sent.get(key, 0.0)
-        if now - last < max(1, int(self.cfg.dedup_seconds)):
-            return
-        self._last_sent[key] = now
-
-        # filter
-        hay = f"{app_id}\n{title}\n{subtitle}\n{msg}\n{date}"
-        if _contains_block(hay, self.cfg.block_keywords, self.cfg.block_case_insensitive):
-            return
-
-        codes = self._extract_codes(f"{title}\n{subtitle}\n{msg}")
-        battery = self.latest_battery
-
-        payload = {
-            "ts": now,
-            "device": self.address,
-            "app": app_id,
-            "title": title,
-            "subtitle": subtitle,
-            "msg": msg,
-            "date": date,
-            "codes": codes,
-            "battery": battery,
-        }
-        self.on_notification(payload)
-
-        bat_text = f"{battery}%" if isinstance(battery, int) else "--"
-
-        # --- Windows toast (NEW, optional) ---
-        if self.cfg.enable_windows_toast and show_toast is not None:
+    async def run(self):
+        while not self._stop.is_set():
             try:
-                toast_title = app_id or "iPhone"
-                toast_body_lines = []
-                if title:
-                    toast_body_lines.append(title)
-                if msg:
-                    toast_body_lines.append(msg)
-                if self.cfg.show_battery_in_message:
-                    toast_body_lines.append(f"🔋 {bat_text}")
-                toast_body = "\n".join(toast_body_lines[:3]).strip()
-                if toast_body:
-                    show_toast(toast_title, toast_body, app_id="NekoLink")
+                await self._connect_and_listen()
+            except Exception as e:
+                self.log(f"[{self.addr}] session error: {e}")
+            # backoff
+            await asyncio.sleep(1.5)
+
+    async def _connect_and_listen(self):
+        self.log(f"[{self.addr}] connecting...")
+        async with BleakClient(self.addr) as client:
+            self.client = client
+            self.log(f"[{self.addr}] connected={client.is_connected}")
+
+            # subscribe notification source and data source
+            await client.start_notify(NOTIF_SRC, self._on_notif_src)
+            await client.start_notify(DATA_SRC, self._on_data_src)
+
+            # keep alive loop
+            while client.is_connected and not self._stop.is_set():
+                await asyncio.sleep(0.25)
+
+            # cleanup
+            try:
+                await client.stop_notify(NOTIF_SRC)
+            except Exception:
+                pass
+            try:
+                await client.stop_notify(DATA_SRC)
             except Exception:
                 pass
 
-        # Build unified forwarded text (battery optional)
-        parts = []
-        parts.append(f"🔔 {app_id}".strip())
-        if title:
-            parts.append(title)
-        if msg:
-            parts.append(msg)
+    async def _read_battery(self) -> Optional[int]:
+        # throttle battery read
+        if self._battery_cache is not None and (_now_ts() - self._last_battery_read) < 5.0:
+            return self._battery_cache
+        if not self.client or not self.client.is_connected:
+            return self._battery_cache
+        try:
+            val = await self.client.read_gatt_char(BATTERY_LEVEL_CHAR)
+            if val and len(val) >= 1:
+                b = int(val[0])
+                if 0 <= b <= 100:
+                    self._battery_cache = b
+                    self._last_battery_read = _now_ts()
+                    return b
+        except Exception:
+            return self._battery_cache
+        return self._battery_cache
 
-        # codes line (optional)
-        codes_line = ""
-        if self.cfg.enable_code_highlight and codes:
-            codes_line = "🔑 " + " ".join(codes)
+    def _on_notif_src(self, _sender: int, data: bytearray):
+        # Format: EventID(1), Flags(1), CategoryID(1), CategoryCount(1), UID(4)
+        if not data or len(data) < 8:
+            return
+        event_id = data[0]
+        uid = int.from_bytes(data[4:8], byteorder="little", signed=False)
 
-        tail = []
-        if codes_line:
-            tail.append(codes_line)
-        if self.cfg.show_battery_in_message:
-            tail.append(f"🔋 {bat_text}")
-        tail.append(f"📱 {self.address}")
-        if date:
-            tail.append(f"🕒 {date}")
+        # Only handle "Added" notifications (event_id == 0)
+        if event_id != 0:
+            return
 
-        final_text = "\n".join([*parts, "", *tail]).strip()
+        # request attributes for this uid
+        self._await_uid = uid
+        self._ds_buf = bytearray()
 
-        self._forward_all(final_text, app_id=app_id)
+        asyncio.create_task(self._request_attributes(uid))
 
-        # Code separately (optional)
-        if self.cfg.enable_code_highlight and self.cfg.code_send_separately and codes:
-            code_text_parts = [f"{self.cfg.code_separate_prefix}: " + " ".join(codes)]
-            if self.cfg.show_battery_in_message:
-                code_text_parts.append(f"🔋 {bat_text}")
-            code_text_parts.append(f"📱 {self.address}")
-            code_text = "\n".join(code_text_parts).strip()
-            self._forward_all(code_text, app_id=app_id)
+    async def _request_attributes(self, uid: int):
+        if not self.client or not self.client.is_connected:
+            return
+        try:
+            # CommandID 0: GetNotificationAttributes
+            # [0x00] + UID(4) + (AttrID + optional maxlen)
+            # Common maxlen values
+            title_len = 64
+            msg_len = 256
 
-        self._pending_uid = None
+            payload = bytearray()
+            payload.append(0x00)
+            payload += uid.to_bytes(4, "little")
 
-    def _forward_all(self, text: str, app_id: str = ""):
-        def _work():
-            if self.cfg.enable_telegram:
+            # AppIdentifier (no maxlen)
+            payload.append(ATTR_APP_IDENTIFIER)
+
+            # Title (with maxlen)
+            payload.append(ATTR_TITLE)
+            payload += int(title_len).to_bytes(2, "little")
+
+            # Message (with maxlen)
+            payload.append(ATTR_MESSAGE)
+            payload += int(msg_len).to_bytes(2, "little")
+
+            # Date (no maxlen)
+            payload.append(ATTR_DATE)
+
+            await self.client.write_gatt_char(CTRL_PT, payload, response=True)
+            self.log(f"[{self.addr}] [CP] requested attributes for uid={uid}")
+        except Exception as e:
+            self.log(f"[{self.addr}] [CP] error: {e}")
+
+    def _on_data_src(self, _sender: int, chunk: bytearray):
+        # Data Source may be fragmented; buffer then parse when possible.
+        if not chunk:
+            return
+        self._ds_buf += chunk
+        self._try_parse_ds()
+
+    def _try_parse_ds(self):
+        # Need at least CommandID(1)+UID(4) => 5 bytes
+        while True:
+            if len(self._ds_buf) < 5:
+                return
+
+            cmd_id = self._ds_buf[0]
+            uid = int.from_bytes(self._ds_buf[1:5], "little", signed=False)
+
+            # We only handle GetNotificationAttributes response (cmd_id=0)
+            if cmd_id != 0x00:
+                # drop unknown
+                self._ds_buf = bytearray()
+                return
+
+            # parse attributes after first 5 bytes
+            pos = 5
+            attrs: Dict[int, str] = {}
+            # we don't know how many attrs will come; try parse until buffer ends
+            while True:
+                if len(self._ds_buf) < pos + 3:
+                    # need more data
+                    return
+                attr_id = self._ds_buf[pos]
+                attr_len = int.from_bytes(self._ds_buf[pos + 1 : pos + 3], "little", signed=False)
+                pos += 3
+                if len(self._ds_buf) < pos + attr_len:
+                    return
+                raw = bytes(self._ds_buf[pos : pos + attr_len])
+                pos += attr_len
                 try:
-                    send_telegram(self.cfg.telegram_bot_token.strip(), self.cfg.telegram_chat_id.strip(), text)
-                    self.log(f"[TG] ok ({app_id})")
-                except Exception as e:
-                    self.log(f"[TG] failed: {e}")
+                    attrs[attr_id] = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    attrs[attr_id] = ""
 
-            if self.cfg.enable_dingtalk:
-                try:
-                    send_dingtalk_text(self.cfg.dingtalk_webhook.strip(), self.cfg.dingtalk_secret.strip(), text)
-                    self.log(f"[DT] ok ({app_id})")
-                except Exception as e:
-                    self.log(f"[DT] failed: {e}")
+                # If we've got the ones we need and next bytes might belong to next response,
+                # we can stop when we've parsed at least app/title/msg/date once.
+                # But safest: continue until buffer ends; then finalize.
+                if pos >= len(self._ds_buf):
+                    break
 
-            if self.cfg.enable_email:
-                try:
-                    send_email(self.cfg, f"NekoLink: {app_id}", text)
-                    self.log(f"[MAIL] ok ({app_id})")
-                except Exception as e:
-                    self.log(f"[MAIL] failed: {e}")
+            # consume buffer
+            self._ds_buf = bytearray()
 
-        threading.Thread(target=_work, daemon=True).start()
+            # build payload and dispatch
+            asyncio.create_task(self._emit_notification(uid, attrs))
+            return
+
+    async def _emit_notification(self, uid: int, attrs: Dict[int, str]):
+        try:
+            app = attrs.get(ATTR_APP_IDENTIFIER, "") or ""
+            title = attrs.get(ATTR_TITLE, "") or ""
+            msg = attrs.get(ATTR_MESSAGE, "") or ""
+            date = attrs.get(ATTR_DATE, "") or ""
+
+            merged_text = "\n".join([app, title, msg, date]).strip()
+
+            # filter
+            if _contains_block_keyword(merged_text, self.cfg.block_keywords, self.cfg.block_case_insensitive):
+                self.log(f"[{self.addr}] [FILTER] blocked")
+                return
+
+            # battery
+            bat = await self._read_battery()
+
+            # codes
+            codes: List[str] = []
+            if self.cfg.enable_code_highlight:
+                codes = _extract_codes(merged_text, self.cfg.code_regex)
+
+            payload = {
+                "ts": _now_ts(),
+                "uid": uid,
+                "device": self.addr,
+                "battery": bat,
+                "app": app,
+                "title": title,
+                "msg": msg,
+                "date": date,
+                "codes": codes,
+            }
+
+            # UI callback
+            self.on_payload(payload)
+
+        except Exception as e:
+            self.log(f"[{self.addr}] emit error: {e}")
 
 
+# -----------------------------
+# BridgeManager
+# -----------------------------
 class BridgeManager:
-    """
-    Multiple devices manager
-    """
-
-    def __init__(self, cfg: BridgeConfig, log: Callable[[str], None], on_notification: Callable[[dict], None]):
+    def __init__(
+        self,
+        cfg: BridgeConfig,
+        log_func: Callable[[str], None],
+        on_notification: Callable[[dict], None],
+    ):
         self.cfg = cfg
-        self.log = log
+        self.log = log_func
         self.on_notification = on_notification
-        self.bridges: Dict[str, SingleDeviceBridge] = {}
 
-    async def scan_heart_rate(self, timeout=8) -> List[Tuple[str, str, int]]:
+        self._threads: Dict[str, threading.Thread] = {}
+        self._loops: Dict[str, asyncio.AbstractEventLoop] = {}
+        self._sessions: Dict[str, _ANCSSession] = {}
+
+        self._stop_flags: Dict[str, threading.Event] = {}
+        self._dedup: Dict[str, float] = {}  # key->last_ts
+
+        self._lock = threading.Lock()
+
+    # ---- scan ----
+    async def scan_heart_rate(self, timeout: int = 8) -> List[Tuple[str, str, int]]:
+        """
+        Scan BLE devices and return "Heart Rate" named devices first.
+        """
         devices = await BleakScanner.discover(timeout=timeout)
         out: List[Tuple[str, str, int]] = []
         for d in devices:
-            name = (d.name or "").strip()
-            if not name:
-                continue
-            # Your LightBlue "Heart Rate" is usually named exactly like this
-            if "heart rate" in name.lower():
+            name = (d.name or "").strip() or "(no name)"
+            addr = d.address
+            rssi = getattr(d, "rssi", None)
+            if rssi is None:
+                rssi = -999
+            # prefer heart-rate named
+            if "heart" in name.lower() or "rate" in name.lower():
+                out.append((name, addr, int(rssi)))
+        # fallback: include all if none heart-rate
+        if not out:
+            for d in devices:
+                name = (d.name or "").strip() or "(no name)"
+                addr = d.address
                 rssi = getattr(d, "rssi", None)
                 if rssi is None:
-                    try:
-                        rssi = d.metadata.get("rssi")  # type: ignore
-                    except Exception:
-                        rssi = -999
-                out.append((name, d.address, int(rssi) if rssi is not None else -999))
+                    rssi = -999
+                out.append((name, addr, int(rssi)))
+        # sort by RSSI desc
         out.sort(key=lambda x: x[2], reverse=True)
         return out
 
-    def start_all(self, addresses: List[str]):
-        for addr in addresses:
-            if addr in self.bridges:
+    # ---- lifecycle ----
+    def start_all(self, addrs: List[str]):
+        addrs = [a.strip() for a in (addrs or []) if a.strip()]
+        if not addrs:
+            return
+        for addr in addrs:
+            if addr in self._threads and self._threads[addr].is_alive():
                 continue
-            b = SingleDeviceBridge(self.cfg, addr, self.log, self.on_notification)
-            self.bridges[addr] = b
-            b.start()
-            self.log(f"[MANAGER] started {addr}")
+            self._start_one(addr)
 
     def stop_all(self):
-        for addr, b in list(self.bridges.items()):
-            b.stop()
-            self.log(f"[MANAGER] stopping {addr}")
-        self.bridges.clear()
+        for addr in list(self._threads.keys()):
+            self._stop_one(addr)
+
+    def _start_one(self, addr: str):
+        stop_flag = threading.Event()
+        self._stop_flags[addr] = stop_flag
+
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loops[addr] = loop
+
+            session = _ANCSSession(addr, self.cfg, self.log, self._on_payload_internal)
+            self._sessions[addr] = session
+
+            async def _main():
+                await session.run()
+
+            try:
+                loop.run_until_complete(_main())
+            except Exception as e:
+                self.log(f"[{addr}] loop error: {e}")
+            finally:
+                try:
+                    loop.stop()
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_runner, daemon=True)
+        self._threads[addr] = t
+        t.start()
+        self.log(f"[MANAGER] started {addr}")
+
+    def _stop_one(self, addr: str):
+        try:
+            loop = self._loops.get(addr)
+            session = self._sessions.get(addr)
+            if loop and session:
+                asyncio.run_coroutine_threadsafe(session.stop(), loop)
+        except Exception:
+            pass
+        self.log(f"[MANAGER] stopping {addr}")
+
+    # ---- payload pipeline ----
+    def _dedup_ok(self, payload: dict) -> bool:
+        window = int(getattr(self.cfg, "dedup_seconds", 8) or 8)
+        key = f"{payload.get('device')}|{payload.get('app')}|{payload.get('title')}|{payload.get('msg')}|{payload.get('date')}"
+        now = _now_ts()
+        with self._lock:
+            last = self._dedup.get(key)
+            if last is not None and (now - last) < window:
+                return False
+            self._dedup[key] = now
+        return True
+
+    def _on_payload_internal(self, payload: dict):
+        # dedup
+        if not self._dedup_ok(payload):
+            return
+
+        # send out
+        try:
+            self._forward(payload)
+        except Exception as e:
+            self.log(f"[FORWARD] error: {e}")
+
+        # UI callback
+        try:
+            self.on_notification(payload)
+        except Exception:
+            pass
+
+    def _forward(self, payload: dict):
+        cfg = self.cfg
+        text = _format_message(payload, cfg)
+
+        # Windows toast
+        if cfg.enable_windows_toast and show_toast is not None:
+            try:
+                show_toast("NekoLink", text)
+            except Exception as e:
+                self.log(f"[TOAST] failed: {e}")
+
+        # Telegram
+        if cfg.enable_telegram:
+            try:
+                send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, text)
+            except Exception as e:
+                self.log(f"[TG] failed: {e}")
+
+        # DingTalk (with signing)
+        if cfg.enable_dingtalk:
+            try:
+                send_dingtalk_text(cfg.dingtalk_webhook, cfg.dingtalk_secret, text)
+            except Exception as e:
+                self.log(f"[DT] failed: {e}")
+
+        # Email
+        if cfg.enable_email:
+            try:
+                send_email(cfg, "NekoLink Notification", text)
+            except Exception as e:
+                self.log(f"[MAIL] failed: {e}")
+
+        # code separately
+        if cfg.enable_code_highlight and cfg.code_send_separately:
+            codes = payload.get("codes") or []
+            if codes:
+                code_text = f"{cfg.code_separate_prefix}: " + " ".join(codes)
+                if cfg.enable_telegram:
+                    try:
+                        send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, code_text)
+                    except Exception as e:
+                        self.log(f"[TG-code] failed: {e}")
+                if cfg.enable_dingtalk:
+                    try:
+                        send_dingtalk_text(cfg.dingtalk_webhook, cfg.dingtalk_secret, code_text)
+                    except Exception as e:
+                        self.log(f"[DT-code] failed: {e}")
+                if cfg.enable_email:
+                    try:
+                        send_email(cfg, "NekoLink Code", code_text)
+                    except Exception as e:
+                        self.log(f"[MAIL-code] failed: {e}")
