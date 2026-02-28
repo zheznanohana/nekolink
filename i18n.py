@@ -1,176 +1,124 @@
 # i18n.py
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+from typing import Dict
 
-LANG_DATA = {
-    "zh": {
-        "app_title": "NekoLink · iPhone 通知转发器（Windows）",
-        "main": "主页",
-        "devices": "设备",
-        "dest": "转发目标",
-        "filter": "屏蔽关键词",
-        "misc": "杂项",
-        "history": "历史",
-        "logs": "日志",
+SUPPORTED = ["zh", "en", "ja"]
 
-        "save": "保存",
-        "start": "开始",
-        "stop": "停止",
-        "running": "● 运行中",
-        "stopped": "● 已停止",
-        "ok": "成功",
-        "fail": "失败",
-        "missing": "缺少信息",
-        "saved_to": "已保存到",
-        "config_path": "配置路径",
+LANG_LABEL = {
+    "zh": "中文",
+    "en": "English",
+    "ja": "日本語",
+}
 
-        "scan": "扫描",
-        "add": "添加",
-        "remove_selected": "删除选中",
-        "clear": "清空",
-        "copy_selected": "复制选中",
-
-        "tg_enable": "启用 Telegram",
-        "tg_token": "Bot Token",
-        "tg_chat": "Chat ID",
-        "tg_test": "测试 Telegram",
-
-        "dt_enable": "启用钉钉",
-        "dt_webhook": "Webhook",
-        "dt_secret": "Secret（加签）",
-        "dt_test": "测试钉钉",
-
-        "mail_enable": "启用邮件",
-        "mail_test": "测试邮件",
-
-        "misc_title": "杂项设置",
-        "show_battery_in_msg": "每条消息带电量",
-        "enable_windows_toast": "使用 Windows 通知通道",
-        "toast_note": "提示：开启后，转发时会在右下角弹出系统通知。",
-
-        "battery": "电量",
-        "dedup": "去重（秒）",
-        "enable_code": "启用验证码识别",
-        "send_code_sep": "验证码单独推送",
-        "history_limit": "历史条数",
-        "preview": "最新通知预览",
-        "tip_tray": "提示：点右上角关闭会最小化到托盘，退出请在托盘菜单中选择 Exit。",
+DICT: Dict[str, Dict[str, str]] = {
+    "app_title": {
+        "zh": "NekoLink · iPhone 通知转发器（Windows）",
+        "en": "NekoLink · iPhone Notification Bridge (Windows)",
+        "ja": "NekoLink · iPhone 通知ブリッジ（Windows）",
     },
-    "en": {
-        "app_title": "NekoLink · iPhone Notification Forwarder (Windows)",
-        "main": "Main",
-        "devices": "Devices",
-        "dest": "Destinations",
-        "filter": "Filters",
-        "misc": "Misc",
-        "history": "History",
-        "logs": "Logs",
-
-        "save": "Save",
-        "start": "Start",
-        "stop": "Stop",
-        "running": "● Running",
-        "stopped": "● Stopped",
-        "ok": "OK",
-        "fail": "Fail",
-        "missing": "Missing",
-        "saved_to": "Saved to",
-        "config_path": "Config Path",
-
-        "scan": "Scan",
-        "add": "Add",
-        "remove_selected": "Remove selected",
-        "clear": "Clear",
-        "copy_selected": "Copy selected",
-
-        "tg_enable": "Enable Telegram",
-        "tg_token": "Bot Token",
-        "tg_chat": "Chat ID",
-        "tg_test": "Test Telegram",
-
-        "dt_enable": "Enable DingTalk",
-        "dt_webhook": "Webhook",
-        "dt_secret": "Secret (signing)",
-        "dt_test": "Test DingTalk",
-
-        "mail_enable": "Enable Email",
-        "mail_test": "Test Email",
-
-        "misc_title": "Misc Settings",
-        "show_battery_in_msg": "Include battery in every message",
-        "enable_windows_toast": "Use Windows toast channel",
-        "toast_note": "Note: When enabled, Windows toast will pop up on forwarding.",
-
-        "battery": "Battery",
-        "dedup": "Dedup (sec)",
-        "enable_code": "Enable code detection",
-        "send_code_sep": "Send code separately",
-        "history_limit": "History limit",
-        "preview": "Latest notification preview",
-        "tip_tray": "Tip: Close button minimizes to tray. Exit from tray menu.",
+    "header_line": {
+        "zh": "iPhone → Windows → Telegram / 钉钉 / Gotify / 邮件",
+        "en": "iPhone → Windows → Telegram / DingTalk / Gotify / Email",
+        "ja": "iPhone → Windows → Telegram / DingTalk / Gotify / メール",
     },
-    "ja": {
-        "app_title": "NekoLink · iPhone 通知転送（Windows）",
-        "main": "メイン",
-        "devices": "デバイス",
-        "dest": "転送先",
-        "filter": "フィルター",
-        "misc": "その他",
-        "history": "履歴",
-        "logs": "ログ",
+    "status_stopped": {"zh": "● 已停止", "en": "● Stopped", "ja": "● 停止中"},
+    "status_running": {"zh": "● 运行中", "en": "● Running", "ja": "● 実行中"},
+    "config_path": {"zh": "配置", "en": "Config", "ja": "設定"},
 
-        "save": "保存",
-        "start": "開始",
-        "stop": "停止",
-        "running": "● 実行中",
-        "stopped": "● 停止中",
-        "ok": "OK",
-        "fail": "失敗",
-        "missing": "未入力",
-        "saved_to": "保存先",
-        "config_path": "設定ファイル",
+    "tab_main": {"zh": "主页", "en": "Main", "ja": "メイン"},
+    "tab_devices": {"zh": "设备", "en": "Devices", "ja": "デバイス"},
+    "tab_dest": {"zh": "转发目标", "en": "Destinations", "ja": "転送先"},
+    "tab_filter": {"zh": "屏蔽关键词", "en": "Block Keywords", "ja": "ブロック"},
+    "tab_misc": {"zh": "杂项", "en": "Misc", "ja": "その他"},
+    "tab_history": {"zh": "历史", "en": "History", "ja": "履歴"},
+    "tab_logs": {"zh": "日志", "en": "Logs", "ja": "ログ"},
 
-        "scan": "スキャン",
-        "add": "追加",
-        "remove_selected": "選択を削除",
-        "clear": "クリア",
-        "copy_selected": "選択をコピー",
+    "save": {"zh": "保存", "en": "Save", "ja": "保存"},
+    "save_all": {"zh": "保存（全部）", "en": "Save (All)", "ja": "保存（全て）"},
+    "start": {"zh": "启动", "en": "Start", "ja": "開始"},
+    "stop": {"zh": "停止", "en": "Stop", "ja": "停止"},
+    "scan": {"zh": "扫描", "en": "Scan", "ja": "スキャン"},
+    "add": {"zh": "添加", "en": "Add", "ja": "追加"},
+    "remove_selected": {"zh": "删除所选", "en": "Remove selected", "ja": "選択削除"},
+    "clear": {"zh": "清空", "en": "Clear", "ja": "クリア"},
+    "copy_selected": {"zh": "复制所选", "en": "Copy selected", "ja": "選択コピー"},
 
-        "tg_enable": "Telegram を有効化",
-        "tg_token": "Bot Token",
-        "tg_chat": "Chat ID",
-        "tg_test": "Telegram テスト",
+    "tip_tray": {
+        "zh": "提示：点击关闭按钮会最小化到托盘。退出请在托盘菜单中操作。",
+        "en": "Tip: Close button will minimize to tray. Exit from tray menu.",
+        "ja": "ヒント：閉じるとトレイに最小化されます。終了はトレイメニューから。",
+    },
 
-        "dt_enable": "DingTalk を有効化",
-        "dt_webhook": "Webhook",
-        "dt_secret": "Secret（署名）",
-        "dt_test": "DingTalk テスト",
+    "run_control": {"zh": "运行控制", "en": "Run Control", "ja": "実行制御"},
+    "dedup_sec": {"zh": "去重（秒）", "en": "Dedup (sec)", "ja": "重複排除(秒)"},
+    "enable_code_detect": {"zh": "启用验证码识别", "en": "Enable code detect", "ja": "コード検出を有効化"},
+    "send_code_sep": {"zh": "验证码单独发送", "en": "Send code separately", "ja": "コードを別送信"},
+    "history_limit": {"zh": "历史条数上限", "en": "History limit", "ja": "履歴上限"},
+    "latest_preview": {"zh": "最新通知预览", "en": "Latest notification preview", "ja": "最新通知プレビュー"},
 
-        "mail_enable": "メールを有効化",
-        "mail_test": "メールテスト",
+    "selected_ble": {"zh": "已选择的 BLE 地址", "en": "Selected BLE addresses", "ja": "選択されたBLEアドレス"},
+    "scan_hint": {
+        "zh": "扫描结果会显示在这里。双击一行可填入地址输入框。",
+        "en": "Scan results will appear here. Double-click a line to fill the address input.",
+        "ja": "スキャン結果がここに表示されます。行をダブルクリックすると入力欄に反映します。",
+    },
 
-        "misc_title": "その他の設定",
-        "show_battery_in_msg": "毎回メッセージに電池残量を付ける",
-        "enable_windows_toast": "Windows 通知を使う",
-        "toast_note": "有効にすると、転送時にWindows通知が表示されます。",
+    "block_intro": {
+        "zh": "屏蔽关键词：通知文本包含任意关键词就会被忽略。",
+        "en": "Block keywords: if notification contains any of these, it will be ignored.",
+        "ja": "ブロック語句：通知に含まれる場合は無視されます。",
+    },
+    "case_insensitive": {"zh": "忽略大小写", "en": "Case-insensitive match", "ja": "大文字小文字を無視"},
 
-        "battery": "バッテリー",
-        "dedup": "重複除外（秒）",
-        "enable_code": "コード検出を有効化",
-        "send_code_sep": "コードを別送",
-        "history_limit": "履歴の上限",
-        "preview": "最新通知プレビュー",
-        "tip_tray": "ヒント：閉じるとトレイに最小化。終了はトレイメニューから。",
+    "misc_title": {"zh": "杂项设置", "en": "Misc Settings", "ja": "その他設定"},
+    "misc_battery": {
+        "zh": "每条消息附带电量",
+        "en": "Include battery in every message",
+        "ja": "各メッセージにバッテリーを付与",
+    },
+    "misc_toast": {
+        "zh": "使用 Windows 通知通道（Toast）",
+        "en": "Use Windows toast channel",
+        "ja": "Windowsトースト通知を使用",
+    },
+
+    "history_title": {"zh": "通知历史", "en": "Notification History", "ja": "通知履歴"},
+    "copied": {"zh": "已复制到剪贴板", "en": "Copied to clipboard", "ja": "クリップボードにコピーしました"},
+    "saved_to": {"zh": "已保存到：", "en": "Saved to:", "ja": "保存先:"},
+    "missing": {"zh": "缺少信息", "en": "Missing", "ja": "未入力"},
+    "ok": {"zh": "成功", "en": "OK", "ja": "OK"},
+    "fail": {"zh": "失败", "en": "Fail", "ja": "失敗"},
+    "no_devices": {"zh": "没有设备", "en": "No devices", "ja": "デバイスなし"},
+    "add_device_warn": {
+        "zh": "请先在 Devices 里添加至少一个地址，或先 Scan 再添加。",
+        "en": "Add at least one address in Devices tab or Scan to add.",
+        "ja": "Devicesでアドレスを追加するか、Scanで見つけて追加してください。",
     },
 }
 
+_current_lang = "zh"
 
-class I18n:
-    def __init__(self, lang: str = "zh"):
-        self.lang = lang if lang in LANG_DATA else "zh"
 
-    def set_lang(self, lang: str):
-        self.lang = lang if lang in LANG_DATA else "zh"
+def set_lang(lang: str):
+    global _current_lang
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED:
+        lang = "zh"
+    _current_lang = lang
 
-    def t(self, key: str) -> str:
-        # fallback: zh -> key
-        return LANG_DATA.get(self.lang, {}).get(key) or LANG_DATA["zh"].get(key) or key
+
+def get_lang() -> str:
+    return _current_lang
+
+
+def lang_label(lang: str) -> str:
+    return LANG_LABEL.get(lang, lang)
+
+
+def t(key: str, fallback: str | None = None) -> str:
+    key = key or ""
+    row = DICT.get(key)
+    if not row:
+        return fallback if fallback is not None else key
+    return row.get(_current_lang) or row.get("en") or fallback or key

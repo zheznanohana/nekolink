@@ -34,10 +34,8 @@ NOTIF_SRC = "9fbf120d-6301-42d9-8c58-25e699a21dbd"
 CTRL_PT = "69d1d8f3-45e1-49a8-9821-9bbdfdaad9d9"
 DATA_SRC = "22eac6e9-24d6-4bb5-be44-b36ace7c7bfb"
 
-# Standard Battery Level characteristic
 BATTERY_LEVEL_CHAR = "00002a19-0000-1000-8000-00805f9b34fb"
 
-# ANCS Attribute IDs
 ATTR_APP_IDENTIFIER = 0
 ATTR_TITLE = 1
 ATTR_SUBTITLE = 2
@@ -51,7 +49,6 @@ ATTR_DATE = 5
 def _base_dir() -> Path:
     try:
         import sys
-
         if getattr(sys, "frozen", False):
             return Path(os.path.dirname(sys.executable)).resolve()
     except Exception:
@@ -112,6 +109,9 @@ def save_config(path: str, cfg: "BridgeConfig"):
 # -----------------------------
 @dataclass
 class BridgeConfig:
+    # UI (NEW) - persisted language: "zh" | "en" | "ja"
+    ui_lang: str = "zh"
+
     # devices
     ble_addresses: List[str] = field(default_factory=list)
     auto_pick_heart_rate: bool = False
@@ -132,8 +132,14 @@ class BridgeConfig:
 
     # dingtalk
     enable_dingtalk: bool = False
-    dingtalk_webhook: str = ""  # must include access_token=xxx
-    dingtalk_secret: str = ""   # if enabled signing in DingTalk robot
+    dingtalk_webhook: str = ""
+    dingtalk_secret: str = ""
+
+    # gotify
+    enable_gotify: bool = False
+    gotify_url: str = ""
+    gotify_token: str = ""
+    gotify_priority: int = 5
 
     # behavior
     dedup_seconds: int = 8
@@ -196,14 +202,6 @@ def send_email(cfg: BridgeConfig, subject: str, body: str):
 
 
 def _dingtalk_signed_url(webhook: str, secret: str) -> str:
-    """
-    DingTalk signing:
-      timestamp = ms
-      string_to_sign = f"{timestamp}\n{secret}"
-      sign = urlencode(base64(hmac_sha256(secret, string_to_sign)))
-      url = webhook + "&timestamp=...&sign=..."
-    If secret empty -> no sign mode.
-    """
     webhook = (webhook or "").strip()
     if not webhook:
         raise ValueError("Missing DingTalk webhook")
@@ -226,11 +224,6 @@ def _dingtalk_signed_url(webhook: str, secret: str) -> str:
 
 
 def send_dingtalk_text(webhook: str, secret: str, text: str, timeout: int = 10):
-    """
-    Robust DingTalk send:
-      - Works in both no-sign and sign-enabled mode
-      - Treat errcode!=0 as failure
-    """
     url = _dingtalk_signed_url(webhook, secret)
     data = {"msgtype": "text", "text": {"content": text}}
     r = requests.post(url, json=data, timeout=timeout)
@@ -245,6 +238,26 @@ def send_dingtalk_text(webhook: str, secret: str, text: str, timeout: int = 10):
 
     if j.get("errcode", 0) != 0:
         raise RuntimeError(str(j))
+
+
+def send_gotify(gotify_url: str, token: str, title: str, message: str, priority: int = 5, timeout: int = 10):
+    """
+    FIX: Use JSON payload (more compatible). Also surface response body when failed.
+    """
+    gotify_url = (gotify_url or "").strip()
+    token = (token or "").strip()
+    if not gotify_url or not token:
+        raise ValueError("Missing Gotify url/token")
+
+    base = gotify_url.rstrip("/")
+    url = f"{base}/message?token={token}"
+    payload = {"title": title, "message": message, "priority": int(priority)}
+
+    r = requests.post(url, json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        # raise but keep body for debugging
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    # gotify normally returns JSON; ignore content here
 
 
 # -----------------------------
@@ -277,7 +290,6 @@ def _extract_codes(text: str, regex: str) -> List[str]:
 
 
 def _format_message(payload: dict, cfg: BridgeConfig) -> str:
-    # main text
     lines = []
     lines.append("📲 iPhone 通知")
     if payload.get("device"):
@@ -316,7 +328,6 @@ class _ANCSSession:
         self.client: Optional[BleakClient] = None
         self._stop = asyncio.Event()
 
-        # buffers
         self._ds_buf: bytearray = bytearray()
         self._await_uid: Optional[int] = None
         self._last_battery_read: float = 0.0
@@ -336,7 +347,6 @@ class _ANCSSession:
                 await self._connect_and_listen()
             except Exception as e:
                 self.log(f"[{self.addr}] session error: {e}")
-            # backoff
             await asyncio.sleep(1.5)
 
     async def _connect_and_listen(self):
@@ -345,15 +355,12 @@ class _ANCSSession:
             self.client = client
             self.log(f"[{self.addr}] connected={client.is_connected}")
 
-            # subscribe notification source and data source
             await client.start_notify(NOTIF_SRC, self._on_notif_src)
             await client.start_notify(DATA_SRC, self._on_data_src)
 
-            # keep alive loop
             while client.is_connected and not self._stop.is_set():
                 await asyncio.sleep(0.25)
 
-            # cleanup
             try:
                 await client.stop_notify(NOTIF_SRC)
             except Exception:
@@ -364,7 +371,6 @@ class _ANCSSession:
                 pass
 
     async def _read_battery(self) -> Optional[int]:
-        # throttle battery read
         if self._battery_cache is not None and (_now_ts() - self._last_battery_read) < 5.0:
             return self._battery_cache
         if not self.client or not self.client.is_connected:
@@ -382,29 +388,20 @@ class _ANCSSession:
         return self._battery_cache
 
     def _on_notif_src(self, _sender: int, data: bytearray):
-        # Format: EventID(1), Flags(1), CategoryID(1), CategoryCount(1), UID(4)
         if not data or len(data) < 8:
             return
         event_id = data[0]
         uid = int.from_bytes(data[4:8], byteorder="little", signed=False)
-
-        # Only handle "Added" notifications (event_id == 0)
         if event_id != 0:
             return
-
-        # request attributes for this uid
         self._await_uid = uid
         self._ds_buf = bytearray()
-
         asyncio.create_task(self._request_attributes(uid))
 
     async def _request_attributes(self, uid: int):
         if not self.client or not self.client.is_connected:
             return
         try:
-            # CommandID 0: GetNotificationAttributes
-            # [0x00] + UID(4) + (AttrID + optional maxlen)
-            # Common maxlen values
             title_len = 64
             msg_len = 256
 
@@ -412,18 +409,14 @@ class _ANCSSession:
             payload.append(0x00)
             payload += uid.to_bytes(4, "little")
 
-            # AppIdentifier (no maxlen)
             payload.append(ATTR_APP_IDENTIFIER)
 
-            # Title (with maxlen)
             payload.append(ATTR_TITLE)
             payload += int(title_len).to_bytes(2, "little")
 
-            # Message (with maxlen)
             payload.append(ATTR_MESSAGE)
             payload += int(msg_len).to_bytes(2, "little")
 
-            # Date (no maxlen)
             payload.append(ATTR_DATE)
 
             await self.client.write_gatt_char(CTRL_PT, payload, response=True)
@@ -432,57 +425,43 @@ class _ANCSSession:
             self.log(f"[{self.addr}] [CP] error: {e}")
 
     def _on_data_src(self, _sender: int, chunk: bytearray):
-        # Data Source may be fragmented; buffer then parse when possible.
         if not chunk:
             return
         self._ds_buf += chunk
         self._try_parse_ds()
 
     def _try_parse_ds(self):
-        # Need at least CommandID(1)+UID(4) => 5 bytes
         while True:
             if len(self._ds_buf) < 5:
                 return
 
             cmd_id = self._ds_buf[0]
             uid = int.from_bytes(self._ds_buf[1:5], "little", signed=False)
-
-            # We only handle GetNotificationAttributes response (cmd_id=0)
             if cmd_id != 0x00:
-                # drop unknown
                 self._ds_buf = bytearray()
                 return
 
-            # parse attributes after first 5 bytes
             pos = 5
             attrs: Dict[int, str] = {}
-            # we don't know how many attrs will come; try parse until buffer ends
             while True:
                 if len(self._ds_buf) < pos + 3:
-                    # need more data
                     return
                 attr_id = self._ds_buf[pos]
-                attr_len = int.from_bytes(self._ds_buf[pos + 1 : pos + 3], "little", signed=False)
+                attr_len = int.from_bytes(self._ds_buf[pos + 1: pos + 3], "little", signed=False)
                 pos += 3
                 if len(self._ds_buf) < pos + attr_len:
                     return
-                raw = bytes(self._ds_buf[pos : pos + attr_len])
+                raw = bytes(self._ds_buf[pos: pos + attr_len])
                 pos += attr_len
                 try:
                     attrs[attr_id] = raw.decode("utf-8", errors="ignore")
                 except Exception:
                     attrs[attr_id] = ""
 
-                # If we've got the ones we need and next bytes might belong to next response,
-                # we can stop when we've parsed at least app/title/msg/date once.
-                # But safest: continue until buffer ends; then finalize.
                 if pos >= len(self._ds_buf):
                     break
 
-            # consume buffer
             self._ds_buf = bytearray()
-
-            # build payload and dispatch
             asyncio.create_task(self._emit_notification(uid, attrs))
             return
 
@@ -494,16 +473,12 @@ class _ANCSSession:
             date = attrs.get(ATTR_DATE, "") or ""
 
             merged_text = "\n".join([app, title, msg, date]).strip()
-
-            # filter
             if _contains_block_keyword(merged_text, self.cfg.block_keywords, self.cfg.block_case_insensitive):
                 self.log(f"[{self.addr}] [FILTER] blocked")
                 return
 
-            # battery
             bat = await self._read_battery()
 
-            # codes
             codes: List[str] = []
             if self.cfg.enable_code_highlight:
                 codes = _extract_codes(merged_text, self.cfg.code_regex)
@@ -519,8 +494,6 @@ class _ANCSSession:
                 "date": date,
                 "codes": codes,
             }
-
-            # UI callback
             self.on_payload(payload)
 
         except Exception as e:
@@ -545,16 +518,10 @@ class BridgeManager:
         self._loops: Dict[str, asyncio.AbstractEventLoop] = {}
         self._sessions: Dict[str, _ANCSSession] = {}
 
-        self._stop_flags: Dict[str, threading.Event] = {}
-        self._dedup: Dict[str, float] = {}  # key->last_ts
-
+        self._dedup: Dict[str, float] = {}
         self._lock = threading.Lock()
 
-    # ---- scan ----
     async def scan_heart_rate(self, timeout: int = 8) -> List[Tuple[str, str, int]]:
-        """
-        Scan BLE devices and return "Heart Rate" named devices first.
-        """
         devices = await BleakScanner.discover(timeout=timeout)
         out: List[Tuple[str, str, int]] = []
         for d in devices:
@@ -563,10 +530,8 @@ class BridgeManager:
             rssi = getattr(d, "rssi", None)
             if rssi is None:
                 rssi = -999
-            # prefer heart-rate named
             if "heart" in name.lower() or "rate" in name.lower():
                 out.append((name, addr, int(rssi)))
-        # fallback: include all if none heart-rate
         if not out:
             for d in devices:
                 name = (d.name or "").strip() or "(no name)"
@@ -575,11 +540,9 @@ class BridgeManager:
                 if rssi is None:
                     rssi = -999
                 out.append((name, addr, int(rssi)))
-        # sort by RSSI desc
         out.sort(key=lambda x: x[2], reverse=True)
         return out
 
-    # ---- lifecycle ----
     def start_all(self, addrs: List[str]):
         addrs = [a.strip() for a in (addrs or []) if a.strip()]
         if not addrs:
@@ -594,9 +557,6 @@ class BridgeManager:
             self._stop_one(addr)
 
     def _start_one(self, addr: str):
-        stop_flag = threading.Event()
-        self._stop_flags[addr] = stop_flag
-
         def _runner():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -637,7 +597,6 @@ class BridgeManager:
             pass
         self.log(f"[MANAGER] stopping {addr}")
 
-    # ---- payload pipeline ----
     def _dedup_ok(self, payload: dict) -> bool:
         window = int(getattr(self.cfg, "dedup_seconds", 8) or 8)
         key = f"{payload.get('device')}|{payload.get('app')}|{payload.get('title')}|{payload.get('msg')}|{payload.get('date')}"
@@ -650,17 +609,14 @@ class BridgeManager:
         return True
 
     def _on_payload_internal(self, payload: dict):
-        # dedup
         if not self._dedup_ok(payload):
             return
 
-        # send out
         try:
             self._forward(payload)
         except Exception as e:
             self.log(f"[FORWARD] error: {e}")
 
-        # UI callback
         try:
             self.on_notification(payload)
         except Exception:
@@ -670,49 +626,65 @@ class BridgeManager:
         cfg = self.cfg
         text = _format_message(payload, cfg)
 
-        # Windows toast
         if cfg.enable_windows_toast and show_toast is not None:
             try:
                 show_toast("NekoLink", text)
             except Exception as e:
                 self.log(f"[TOAST] failed: {e}")
 
-        # Telegram
         if cfg.enable_telegram:
             try:
                 send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, text)
             except Exception as e:
                 self.log(f"[TG] failed: {e}")
 
-        # DingTalk (with signing)
         if cfg.enable_dingtalk:
             try:
                 send_dingtalk_text(cfg.dingtalk_webhook, cfg.dingtalk_secret, text)
             except Exception as e:
                 self.log(f"[DT] failed: {e}")
 
-        # Email
+        if cfg.enable_gotify:
+            try:
+                send_gotify(cfg.gotify_url, cfg.gotify_token, "NekoLink", text, priority=cfg.gotify_priority)
+            except Exception as e:
+                self.log(f"[GOTIFY] failed: {e}")
+
         if cfg.enable_email:
             try:
                 send_email(cfg, "NekoLink Notification", text)
             except Exception as e:
                 self.log(f"[MAIL] failed: {e}")
 
-        # code separately
         if cfg.enable_code_highlight and cfg.code_send_separately:
             codes = payload.get("codes") or []
             if codes:
                 code_text = f"{cfg.code_separate_prefix}: " + " ".join(codes)
+
                 if cfg.enable_telegram:
                     try:
                         send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, code_text)
                     except Exception as e:
                         self.log(f"[TG-code] failed: {e}")
+
                 if cfg.enable_dingtalk:
                     try:
                         send_dingtalk_text(cfg.dingtalk_webhook, cfg.dingtalk_secret, code_text)
                     except Exception as e:
                         self.log(f"[DT-code] failed: {e}")
+
+                if cfg.enable_gotify:
+                    try:
+                        send_gotify(
+                            cfg.gotify_url,
+                            cfg.gotify_token,
+                            "NekoLink Code",
+                            code_text,
+                            priority=max(7, int(cfg.gotify_priority)),
+                        )
+                    except Exception as e:
+                        self.log(f"[GOTIFY-code] failed: {e}")
+
                 if cfg.enable_email:
                     try:
                         send_email(cfg, "NekoLink Code", code_text)
