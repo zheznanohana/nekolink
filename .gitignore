@@ -1,0 +1,25 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller
+build/
+dist/
+dist2/
+*.spec
+
+# Local config (optional: keep if you want)
+# config.json
+
+# Logs
+*.log
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+
+# Local private config
+config.json
+

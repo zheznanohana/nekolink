@@ -1,322 +1,239 @@
+# app_gui.py
+# -*- coding: utf-8 -*-
 import os
-import json
 import queue
-import time
 import threading
+import time
 import tkinter as tk
-
-import requests
-import ttkbootstrap as tb
-from ttkbootstrap.constants import *
 from tkinter import messagebox
 
-from ancs_bridge import BridgeConfig, BridgeManager
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+
+from ancs_bridge import (
+    BridgeConfig,
+    BridgeManager,
+    get_config_path,
+    load_config,
+    save_config,
+    send_dingtalk_text,
+    send_email,
+    send_telegram,
+)
 from tray_helper import TrayController
-from i18n import t
+from i18n import I18n
 
-# Always read/write config.json next to this script
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-
-
-def _bridge_field_set():
-    try:
-        from dataclasses import fields
-        return {f.name for f in fields(BridgeConfig)}
-    except Exception:
-        return set()
-
-
-BRIDGE_FIELDS = _bridge_field_set()
+CONFIG_PATH = get_config_path()
+ICON_PATH = "icon.ico"
 
 
 class App(tb.Window):
     def __init__(self):
         super().__init__(themename="flatly")
-        self.geometry("1100x680")
+        self.i18n = I18n("zh")
+
+        self.title(self.i18n.t("app_title"))
+        self.geometry("1100x720")
+        self.minsize(980, 620)
 
         self.log_q = queue.Queue()
+        self.cfg: BridgeConfig = load_config(CONFIG_PATH)
 
-        # UI-only
-        self.ui_lang = "zh"
-        self._dirty = False
-        self._restore_state = "normal"  # remember normal/zoomed when minimizing
-
-        self.cfg = self.load_config()
         self.manager = BridgeManager(self.cfg, self.log, self.on_notification)
         self.running = False
+        self.history = []
+
+        # per-tab dirty
+        self.dirty = {"devices": False, "filter": False, "dest": False, "misc": False}
+        self._dirty_widgets = {}  # tab_key -> (dot_label, save_btn)
 
         # tray
+        icon_path = ICON_PATH if os.path.exists(ICON_PATH) else None
         self.tray = TrayController(
             title="NekoLink",
             on_restore=self.restore_from_tray,
             on_exit=self.exit_app,
+            icon_path=icon_path,
         )
         self.tray.start()
 
-        self.history = []
-
         self._build_ui()
-        self.apply_i18n()
-        self.set_dirty(False)
-
         self._flush_logs()
+        self.protocol("WM_DELETE_WINDOW", self.on_close_to_tray)
 
-        # Click X -> minimize (keeps taskbar workable)
-        self.protocol("WM_DELETE_WINDOW", self.on_close_minimize)
+    # ---------- Dirty helpers ----------
+    def mark_dirty(self, tab_key: str):
+        if tab_key not in self.dirty:
+            return
+        self.dirty[tab_key] = True
+        w = self._dirty_widgets.get(tab_key)
+        if w:
+            dot, _btn = w
+            dot.configure(text="●", bootstyle="danger")
+            dot.lift()
 
-    # ---------- i18n / dirty ----------
-    def apply_i18n(self):
-        title = t(self.ui_lang, "app_title")
-        self.title(title + (" •" if self._dirty else ""))
+    def clear_dirty(self, tab_key: str):
+        if tab_key not in self.dirty:
+            return
+        self.dirty[tab_key] = False
+        w = self._dirty_widgets.get(tab_key)
+        if w:
+            dot, _btn = w
+            dot.configure(text="", bootstyle="secondary")
 
-        self.lbl_header_title.config(text=t(self.ui_lang, "header_title"))
-        self.lbl_status.config(text=t(self.ui_lang, "running") if self.running else t(self.ui_lang, "stopped"))
-        self.lbl_unsaved.config(text=t(self.ui_lang, "unsaved"))
+    def add_tab_save_bar(self, parent, tab_key: str, save_func):
+        bar = tb.Frame(parent)
+        bar.place(relx=1.0, rely=1.0, anchor="se", x=-12, y=-12)
 
-        self.nb.tab(self.tab_main, text=t(self.ui_lang, "tab_main"))
-        self.nb.tab(self.tab_devices, text=t(self.ui_lang, "tab_devices"))
-        self.nb.tab(self.tab_dest, text=t(self.ui_lang, "tab_destinations"))
-        self.nb.tab(self.tab_block, text=t(self.ui_lang, "tab_block"))
-        self.nb.tab(self.tab_history, text=t(self.ui_lang, "tab_history"))
-        self.nb.tab(self.tab_logs, text=t(self.ui_lang, "tab_logs"))
+        dot = tb.Label(bar, text="", bootstyle="secondary", font=("Segoe UI", 14, "bold"))
+        dot.pack(side=LEFT, padx=(0, 8))
 
-        self.lbl_lang.config(text=t(self.ui_lang, "lbl_language"))
+        btn = tb.Button(bar, text=self.i18n.t("save"), bootstyle="primary", command=save_func)
+        btn.pack(side=LEFT)
 
-        # Main
-        self.btn_main_save.config(text=t(self.ui_lang, "btn_save"))
-        self.btn_main_start.config(text=t(self.ui_lang, "btn_start"))
-        self.btn_main_stop.config(text=t(self.ui_lang, "btn_stop"))
-        self.lbl_dedup.config(text=t(self.ui_lang, "lbl_dedup"))
-        self.chk_code_detect.config(text=t(self.ui_lang, "chk_code_detect"))
-        self.chk_code_sep.config(text=t(self.ui_lang, "chk_code_separate"))
-        self.lbl_history_limit.config(text=t(self.ui_lang, "lbl_history_limit"))
-        self.lbl_preview_title.config(text=t(self.ui_lang, "lbl_latest_preview"))
-        self.lbl_tip.config(text=t(self.ui_lang, "lbl_tip_tray"))
-        self.lbl_cfg_path.config(text=f"{t(self.ui_lang, 'lbl_config_path')} {CONFIG_PATH}")
+        self._dirty_widgets[tab_key] = (dot, btn)
 
-        # Devices
-        self.lbl_devices_title.config(text=t(self.ui_lang, "devices_title"))
-        self.btn_scan.config(text=t(self.ui_lang, "btn_scan"))
-        self.btn_add_addr.config(text=t(self.ui_lang, "btn_add"))
-        self.btn_remove_addr.config(text=t(self.ui_lang, "btn_remove_selected"))
-        self.lbl_scan_hint.config(text=t(self.ui_lang, "devices_scan_hint"))
-        self.btn_devices_save.config(text=t(self.ui_lang, "btn_save"))
+    # ---------- Page save ----------
+    def _save_any(self, tab_key: str):
+        cfg = self.collect_config()
+        save_config(CONFIG_PATH, cfg)
+        self.cfg = cfg
+        self.manager.cfg = cfg
+        self.clear_dirty(tab_key)
+        messagebox.showinfo(self.i18n.t("ok"), f"{self.i18n.t('saved_to')}\n{CONFIG_PATH}")
 
-        # Destinations
-        self.chk_tg_enable.config(text=t(self.ui_lang, "dest_tg_enable"))
-        self.lbl_tg_token.config(text=t(self.ui_lang, "dest_tg_token"))
-        self.lbl_tg_chat.config(text=t(self.ui_lang, "dest_tg_chat"))
-        self.btn_tg_showhide.config(text=t(self.ui_lang, "dest_show_hide"))
-        self.btn_tg_test.config(text=t(self.ui_lang, "btn_test"))
+    def save_devices_tab(self):
+        self._save_any("devices")
 
-        self.chk_mail_enable.config(text=t(self.ui_lang, "dest_email_enable"))
-        self.lbl_mail_host.config(text=t(self.ui_lang, "dest_email_host"))
-        self.lbl_mail_port.config(text=t(self.ui_lang, "dest_email_port"))
-        self.lbl_mail_user.config(text=t(self.ui_lang, "dest_email_user"))
-        self.lbl_mail_pass.config(text=t(self.ui_lang, "dest_email_pass"))
-        self.lbl_mail_from.config(text=t(self.ui_lang, "dest_email_from"))
-        self.lbl_mail_to.config(text=t(self.ui_lang, "dest_email_to"))
-        self.btn_mail_test.config(text=t(self.ui_lang, "btn_test"))
-        self.btn_dest_save.config(text=t(self.ui_lang, "btn_save"))
+    def save_filter_tab(self):
+        self._save_any("filter")
 
-        # Block
-        self.lbl_block_title.config(text=t(self.ui_lang, "block_title"))
-        self.chk_block_ci.config(text=t(self.ui_lang, "block_case_insensitive"))
-        self.btn_block_add.config(text=t(self.ui_lang, "btn_add"))
-        self.btn_block_remove.config(text=t(self.ui_lang, "btn_remove_selected"))
-        self.btn_block_save.config(text=t(self.ui_lang, "btn_save"))
+    def save_dest_tab(self):
+        self._save_any("dest")
 
-        # History / Logs
-        self.lbl_history_title.config(text=t(self.ui_lang, "history_title"))
-        self.btn_hist_clear.config(text=t(self.ui_lang, "btn_clear"))
-        self.btn_hist_copy.config(text=t(self.ui_lang, "btn_copy_selected"))
-
-        self.lbl_logs_title.config(text=t(self.ui_lang, "logs_title"))
-        self.btn_logs_clear.config(text=t(self.ui_lang, "btn_clear"))
-
-    def set_dirty(self, dirty: bool):
-        self._dirty = bool(dirty)
-        self.lbl_unsaved.pack_forget()
-        if self._dirty:
-            self.lbl_unsaved.pack(side=RIGHT, padx=(8, 0))
-        self.apply_i18n()
-
-    def mark_dirty(self, *_args):
-        if not self._dirty:
-            self.set_dirty(True)
+    def save_misc_tab(self):
+        self._save_any("misc")
 
     # ---------- UI ----------
     def _build_ui(self):
         root = tb.Frame(self, padding=10)
         root.pack(fill=BOTH, expand=True)
 
-        # Header
         header = tb.Frame(root)
         header.pack(fill=X)
 
-        self.lbl_header_title = tb.Label(header, text="", font=("Segoe UI", 16, "bold"))
-        self.lbl_header_title.pack(side=LEFT)
+        self.lbl_title = tb.Label(header, text="iPhone → Windows → Telegram / DingTalk / Email", font=("Segoe UI", 16, "bold"))
+        self.lbl_title.pack(side=LEFT)
 
-        right = tb.Frame(header)
-        right.pack(side=RIGHT)
+        # language selector
+        self.var_lang = tk.StringVar(value=self.i18n.lang)
+        lang_box = tb.Combobox(header, textvariable=self.var_lang, values=["zh", "en", "ja"], width=6, state="readonly")
+        lang_box.pack(side=RIGHT, padx=(8, 0))
+        lang_box.bind("<<ComboboxSelected>>", lambda _e: self.on_change_lang())
 
-        self.lbl_unsaved = tb.Label(right, text="", bootstyle="warning")
-        # packed only when dirty
+        self.lbl_status = tb.Label(header, text=self.i18n.t("stopped"), bootstyle="danger")
+        self.lbl_status.pack(side=RIGHT, padx=(8, 0))
 
-        self.lbl_status = tb.Label(right, text="", bootstyle="danger")
-        self.lbl_status.pack(side=RIGHT)
+        self.lbl_cfg = tb.Label(header, text=f"{self.i18n.t('config_path')}: {CONFIG_PATH}", bootstyle="secondary")
+        self.lbl_cfg.pack(side=RIGHT)
 
-        tb.Separator(root).pack(fill=X, pady=(10, 8))
-
-        # Language selector
-        langbar = tb.Frame(root)
-        langbar.pack(fill=X, pady=(0, 8))
-        self.lbl_lang = tb.Label(langbar, text="")
-        self.lbl_lang.pack(side=LEFT)
-
-        self.var_lang = tk.StringVar(value=self.ui_lang)
-        self.cmb_lang = tb.Combobox(langbar, textvariable=self.var_lang, values=["zh", "ja", "en"], width=6, state="readonly")
-        self.cmb_lang.pack(side=LEFT, padx=(8, 0))
-        self.cmb_lang.bind("<<ComboboxSelected>>", self.on_change_language)
-
-        # Tabs
         self.nb = tb.Notebook(root)
-        self.nb.pack(fill=BOTH, expand=True)
+        self.nb.pack(fill=BOTH, expand=True, pady=(10, 0))
 
         self.tab_main = tb.Frame(self.nb)
         self.tab_devices = tb.Frame(self.nb)
         self.tab_dest = tb.Frame(self.nb)
-        self.tab_block = tb.Frame(self.nb)
+        self.tab_filter = tb.Frame(self.nb)
+        self.tab_misc = tb.Frame(self.nb)
         self.tab_history = tb.Frame(self.nb)
         self.tab_logs = tb.Frame(self.nb)
 
-        self.nb.add(self.tab_main, text="Main")
-        self.nb.add(self.tab_devices, text="Devices")
-        self.nb.add(self.tab_dest, text="Destinations")
-        self.nb.add(self.tab_block, text="Block")
-        self.nb.add(self.tab_history, text="History")
-        self.nb.add(self.tab_logs, text="Logs")
+        self.nb.add(self.tab_main, text=self.i18n.t("main"))
+        self.nb.add(self.tab_devices, text=self.i18n.t("devices"))
+        self.nb.add(self.tab_dest, text=self.i18n.t("dest"))
+        self.nb.add(self.tab_filter, text=self.i18n.t("filter"))
+        self.nb.add(self.tab_misc, text=self.i18n.t("misc"))
+        self.nb.add(self.tab_history, text=self.i18n.t("history"))
+        self.nb.add(self.tab_logs, text=self.i18n.t("logs"))
 
-        self._build_tab_main()
-        self._build_tab_devices()
-        self._build_tab_dest()
-        self._build_tab_block()
-        self._build_tab_history()
-        self._build_tab_logs()
+        self._build_main()
+        self._build_devices()
+        self._build_dest()
+        self._build_filter()
+        self._build_misc()
+        self._build_history()
+        self._build_logs()
 
-    # ---------- Savebar helper ----------
-    def _tab_with_savebar(self, tab: tb.Frame, save_command, save_btn_attr: str):
-        tab.grid_rowconfigure(0, weight=1)
-        tab.grid_columnconfigure(0, weight=1)
+    def _build_main(self):
+        frm = tb.Frame(self.tab_main, padding=12)
+        frm.pack(fill=BOTH, expand=True)
 
-        content = tb.Frame(tab, padding=12)
-        content.grid(row=0, column=0, sticky="nsew")
+        left = tb.Frame(frm)
+        left.pack(side=LEFT, fill=Y, padx=(0, 16))
 
-        savebar = tb.Frame(tab, padding=10)
-        savebar.grid(row=1, column=0, sticky="ew")
-        savebar.grid_columnconfigure(0, weight=1)
-        tb.Frame(savebar).grid(row=0, column=0, sticky="ew")
+        tb.Label(left, text="Run Control", font=("Segoe UI", 12, "bold")).pack(anchor=W, pady=(0, 8))
 
-        btn = tb.Button(savebar, text="Save", bootstyle="secondary", command=save_command)
-        btn.grid(row=0, column=1, sticky="e")
-
-        setattr(self, save_btn_attr, btn)
-        return content
-
-    # ---------- Main ----------
-    def _build_tab_main(self):
-        content = self._tab_with_savebar(self.tab_main, self.on_save, "btn_main_save")
-        content.grid_rowconfigure(0, weight=1)
-        content.grid_columnconfigure(1, weight=1)
-
-        left = tb.Frame(content)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 16))
-
-        right = tb.Frame(content)
-        right.grid(row=0, column=1, sticky="nsew")
-
-        runbar = tb.Frame(left)
-        runbar.pack(anchor=W, pady=(0, 10))
-
-        self.btn_main_start = tb.Button(runbar, text="Start", bootstyle="success", command=self.on_start)
-        self.btn_main_start.pack(side=LEFT, padx=(0, 8))
-        self.btn_main_stop = tb.Button(runbar, text="Stop", bootstyle="danger", command=self.on_stop)
-        self.btn_main_stop.pack(side=LEFT)
+        btns = tb.Frame(left)
+        btns.pack(anchor=W, pady=(0, 8))
+        tb.Button(btns, text=self.i18n.t("save"), bootstyle="secondary", command=self.on_save).pack(side=LEFT, padx=(0, 8))
+        tb.Button(btns, text=self.i18n.t("start"), bootstyle="success", command=self.on_start).pack(side=LEFT, padx=(0, 8))
+        tb.Button(btns, text=self.i18n.t("stop"), bootstyle="danger", command=self.on_stop).pack(side=LEFT)
 
         tb.Separator(left).pack(fill=X, pady=10)
 
         self.var_dedup = tk.StringVar(value=str(getattr(self.cfg, "dedup_seconds", 8)))
-        self.lbl_dedup = tb.Label(left, text="")
-        self.lbl_dedup.pack(anchor=W)
-        tb.Entry(left, textvariable=self.var_dedup, width=10).pack(anchor=W, pady=(0, 10))
+        tb.Label(left, text=self.i18n.t("dedup")).pack(anchor=W)
+        e = tb.Entry(left, textvariable=self.var_dedup, width=10)
+        e.pack(anchor=W, pady=(0, 10))
+        self.var_dedup.trace_add("write", lambda *_: None)
 
-        self.var_code_on = tk.BooleanVar(value=getattr(self.cfg, "enable_code_highlight", True))
-        self.var_code_sep = tk.BooleanVar(value=getattr(self.cfg, "code_send_separately", True))
-        self.chk_code_detect = tb.Checkbutton(left, text="", variable=self.var_code_on, bootstyle="round-toggle")
-        self.chk_code_detect.pack(anchor=W, pady=(0, 6))
-        self.chk_code_sep = tb.Checkbutton(left, text="", variable=self.var_code_sep, bootstyle="round-toggle")
-        self.chk_code_sep.pack(anchor=W)
+        self.var_code_on = tk.BooleanVar(value=self.cfg.enable_code_highlight)
+        self.var_code_sep = tk.BooleanVar(value=self.cfg.code_send_separately)
+        tb.Checkbutton(left, text=self.i18n.t("enable_code"), variable=self.var_code_on, bootstyle="round-toggle").pack(anchor=W, pady=(0, 6))
+        tb.Checkbutton(left, text=self.i18n.t("send_code_sep"), variable=self.var_code_sep, bootstyle="round-toggle").pack(anchor=W)
 
-        self.var_history_limit = tk.StringVar(value=str(getattr(self.cfg, "history_limit", 300)))
-        self.lbl_history_limit = tb.Label(left, text="")
-        self.lbl_history_limit.pack(anchor=W, pady=(10, 0))
+        self.var_history_limit = tk.StringVar(value=str(self.cfg.history_limit))
+        tb.Label(left, text=self.i18n.t("history_limit")).pack(anchor=W, pady=(10, 0))
         tb.Entry(left, textvariable=self.var_history_limit, width=10).pack(anchor=W)
 
-        self.lbl_preview_title = tb.Label(right, text="", font=("Segoe UI", 12, "bold"))
-        self.lbl_preview_title.pack(anchor=W)
-        self.preview = tk.Text(right, height=8, wrap="word")
+        right = tb.Frame(frm)
+        right.pack(side=LEFT, fill=BOTH, expand=True)
+
+        tb.Label(right, text=self.i18n.t("preview"), font=("Segoe UI", 12, "bold")).pack(anchor=W)
+        self.preview = tk.Text(right, height=9, wrap="word")
         self.preview.pack(fill=X, pady=(8, 8))
         self.preview.insert("end", "（暂无）\n")
 
-        self.lbl_tip = tb.Label(right, text="")
-        self.lbl_tip.pack(anchor=W)
+        tb.Label(right, text=self.i18n.t("tip_tray")).pack(anchor=W)
 
-        self.lbl_cfg_path = tb.Label(right, text="")
-        self.lbl_cfg_path.pack(anchor=W, pady=(6, 0))
+    def _build_devices(self):
+        frm = tb.Frame(self.tab_devices, padding=12)
+        frm.pack(fill=BOTH, expand=True)
 
-        # dirty watchers
-        self.var_dedup.trace_add("write", self.mark_dirty)
-        self.var_code_on.trace_add("write", self.mark_dirty)
-        self.var_code_sep.trace_add("write", self.mark_dirty)
-        self.var_history_limit.trace_add("write", self.mark_dirty)
-
-    # ---------- Devices ----------
-    def _build_tab_devices(self):
-        content = self._tab_with_savebar(self.tab_devices, self.on_save, "btn_devices_save")
-
-        top = tb.Frame(content)
+        top = tb.Frame(frm)
         top.pack(fill=X, pady=(0, 10))
 
-        self.lbl_devices_title = tb.Label(top, text="", font=("Segoe UI", 12, "bold"))
-        self.lbl_devices_title.pack(side=LEFT)
+        tb.Label(top, text="Selected BLE addresses (Heart Rate devices)", font=("Segoe UI", 12, "bold")).pack(side=LEFT)
+        tb.Button(top, text=self.i18n.t("scan"), bootstyle="info", command=self.scan_devices).pack(side=RIGHT)
 
-        self.btn_scan = tb.Button(top, text="Scan", bootstyle="info", command=self.scan_devices)
-        self.btn_scan.pack(side=RIGHT)
-
-        self.lst_addr = tk.Listbox(content, height=10)
+        self.lst_addr = tk.Listbox(frm, height=10)
         self.lst_addr.pack(fill=X, pady=(0, 10))
-        for a in (getattr(self.cfg, "ble_addresses", []) or []):
+        for a in (self.cfg.ble_addresses or []):
             self.lst_addr.insert("end", a)
 
-        ctl = tb.Frame(content)
-        ctl.pack(fill=X, pady=(0, 10))
+        ctl = tb.Frame(frm)
+        ctl.pack(fill=X)
 
         self.var_add_addr = tk.StringVar()
         tb.Entry(ctl, textvariable=self.var_add_addr, width=40).pack(side=LEFT, padx=(0, 8))
+        tb.Button(ctl, text=self.i18n.t("add"), bootstyle="secondary", command=self.add_addr).pack(side=LEFT, padx=(0, 8))
+        tb.Button(ctl, text=self.i18n.t("remove_selected"), bootstyle="warning", command=self.remove_selected_addr).pack(side=LEFT)
 
-        self.btn_add_addr = tb.Button(ctl, text="Add", bootstyle="secondary", command=self.add_addr)
-        self.btn_add_addr.pack(side=LEFT, padx=(0, 8))
+        tb.Separator(frm).pack(fill=X, pady=12)
 
-        self.btn_remove_addr = tb.Button(ctl, text="Remove selected", bootstyle="warning", command=self.remove_selected_addr)
-        self.btn_remove_addr.pack(side=LEFT)
-
-        self.lbl_scan_hint = tb.Label(content, text="")
-        self.lbl_scan_hint.pack(anchor=W, pady=(10, 4))
-
-        self.scan_box = tk.Text(content, height=10, wrap="word")
+        self.scan_box = tk.Text(frm, height=10, wrap="word")
         self.scan_box.pack(fill=BOTH, expand=True)
-        self.scan_box.insert("end", "Scan results will appear here.\n")
+        self.scan_box.insert("end", "Scan results will appear here. Double-click an address to add.\n")
 
         def on_dbl_click(_evt):
             try:
@@ -329,240 +246,270 @@ class App(tb.Window):
 
         self.scan_box.bind("<Double-Button-1>", on_dbl_click)
 
-    # ---------- Destinations ----------
-    def _build_tab_dest(self):
-        content = self._tab_with_savebar(self.tab_dest, self.on_save, "btn_dest_save")
+        # per-page save
+        self.add_tab_save_bar(frm, "devices", self.save_devices_tab)
 
-        tg = tb.Labelframe(content, text="Telegram", padding=10)
+    def _build_dest(self):
+        frm = tb.Frame(self.tab_dest, padding=12)
+        frm.pack(fill=BOTH, expand=True)
+
+        # Telegram
+        tg = tb.Labelframe(frm, text="Telegram", padding=10)
         tg.pack(fill=X, pady=(0, 12))
 
-        self.var_tg_on = tk.BooleanVar(value=getattr(self.cfg, "enable_telegram", True))
-        self.var_tg_token = tk.StringVar(value=getattr(self.cfg, "telegram_bot_token", ""))
-        self.var_tg_chat = tk.StringVar(value=getattr(self.cfg, "telegram_chat_id", ""))
+        self.var_tg_on = tk.BooleanVar(value=self.cfg.enable_telegram)
+        self.var_tg_token = tk.StringVar(value=self.cfg.telegram_bot_token)
+        self.var_tg_chat = tk.StringVar(value=self.cfg.telegram_chat_id)
 
-        self.chk_tg_enable = tb.Checkbutton(tg, text="", variable=self.var_tg_on, bootstyle="round-toggle")
-        self.chk_tg_enable.grid(row=0, column=0, sticky=W, pady=(0, 6))
+        tb.Checkbutton(tg, text=self.i18n.t("tg_enable"), variable=self.var_tg_on, bootstyle="round-toggle").grid(row=0, column=0, sticky=W, pady=(0, 6))
 
-        self.lbl_tg_token = tb.Label(tg, text="")
-        self.lbl_tg_token.grid(row=1, column=0, sticky=W)
+        tb.Label(tg, text=self.i18n.t("tg_token")).grid(row=1, column=0, sticky=W)
+        self.ent_tg_token = tb.Entry(tg, textvariable=self.var_tg_token, width=64, show="•")
+        self.ent_tg_token.grid(row=1, column=1, sticky=W, pady=2)
+        self._tg_token_hidden = True
 
-        self.ent_token = tb.Entry(tg, textvariable=self.var_tg_token, width=70, show="•")
-        self.ent_token.grid(row=1, column=1, sticky=W, pady=2)
+        def toggle_tg_token():
+            self._tg_token_hidden = not self._tg_token_hidden
+            self.ent_tg_token.config(show=("•" if self._tg_token_hidden else ""))
 
-        self._token_hidden = True
-        self.btn_tg_showhide = tb.Button(tg, text="", bootstyle="secondary", command=self.toggle_token_visibility)
-        self.btn_tg_showhide.grid(row=1, column=2, sticky=W, padx=(8, 0))
+        tb.Button(tg, text="👁", width=3, bootstyle="secondary", command=toggle_tg_token).grid(row=1, column=2, sticky=W, padx=(6, 0))
 
-        self.lbl_tg_chat = tb.Label(tg, text="")
-        self.lbl_tg_chat.grid(row=2, column=0, sticky=W)
-
+        tb.Label(tg, text=self.i18n.t("tg_chat")).grid(row=2, column=0, sticky=W)
         tb.Entry(tg, textvariable=self.var_tg_chat, width=30).grid(row=2, column=1, sticky=W, pady=2)
+        tb.Button(tg, text=self.i18n.t("tg_test"), bootstyle="success", command=self.test_telegram).grid(row=3, column=1, sticky=W, pady=(8, 0))
 
-        self.btn_tg_test = tb.Button(tg, text="Test", bootstyle="success", command=self.test_telegram)
-        self.btn_tg_test.grid(row=3, column=1, sticky=W, pady=(8, 0))
+        # DingTalk
+        dt = tb.Labelframe(frm, text="DingTalk", padding=10)
+        dt.pack(fill=X, pady=(0, 12))
 
-        mail = tb.Labelframe(content, text="Email (SMTP)", padding=10)
+        self.var_dt_on = tk.BooleanVar(value=getattr(self.cfg, "enable_dingtalk", False))
+        self.var_dt_webhook = tk.StringVar(value=getattr(self.cfg, "dingtalk_webhook", ""))
+        self.var_dt_secret = tk.StringVar(value=getattr(self.cfg, "dingtalk_secret", ""))
+
+        tb.Checkbutton(dt, text=self.i18n.t("dt_enable"), variable=self.var_dt_on, bootstyle="round-toggle").grid(row=0, column=0, sticky=W, pady=(0, 6))
+        tb.Label(dt, text=self.i18n.t("dt_webhook")).grid(row=1, column=0, sticky=W)
+        tb.Entry(dt, textvariable=self.var_dt_webhook, width=78).grid(row=1, column=1, sticky=W, pady=2)
+
+        tb.Label(dt, text=self.i18n.t("dt_secret")).grid(row=2, column=0, sticky=W)
+        self.ent_dt_secret = tb.Entry(dt, textvariable=self.var_dt_secret, width=36, show="•")
+        self.ent_dt_secret.grid(row=2, column=1, sticky=W, pady=2)
+        self._dt_secret_hidden = True
+
+        def toggle_dt_secret():
+            self._dt_secret_hidden = not self._dt_secret_hidden
+            self.ent_dt_secret.config(show=("•" if self._dt_secret_hidden else ""))
+
+        tb.Button(dt, text="👁", width=3, bootstyle="secondary", command=toggle_dt_secret).grid(row=2, column=2, sticky=W, padx=(6, 0))
+        tb.Button(dt, text=self.i18n.t("dt_test"), bootstyle="success", command=self.test_dingtalk).grid(row=3, column=1, sticky=W, pady=(8, 0))
+
+        # Email
+        mail = tb.Labelframe(frm, text="Email (SMTP)", padding=10)
         mail.pack(fill=X)
 
-        self.var_mail_on = tk.BooleanVar(value=getattr(self.cfg, "enable_email", False))
-        self.var_smtp_host = tk.StringVar(value=getattr(self.cfg, "smtp_host", "smtp.gmail.com"))
-        self.var_smtp_port = tk.StringVar(value=str(getattr(self.cfg, "smtp_port", 587)))
-        self.var_smtp_user = tk.StringVar(value=getattr(self.cfg, "smtp_user", ""))
-        self.var_smtp_pass = tk.StringVar(value=getattr(self.cfg, "smtp_pass", ""))
-        self.var_email_from = tk.StringVar(value=getattr(self.cfg, "email_from", ""))
-        self.var_email_to = tk.StringVar(value=getattr(self.cfg, "email_to", ""))
+        self.var_mail_on = tk.BooleanVar(value=self.cfg.enable_email)
+        self.var_smtp_host = tk.StringVar(value=self.cfg.smtp_host)
+        self.var_smtp_port = tk.StringVar(value=str(self.cfg.smtp_port))
+        self.var_smtp_user = tk.StringVar(value=self.cfg.smtp_user)
+        self.var_smtp_pass = tk.StringVar(value=self.cfg.smtp_pass)
+        self.var_email_from = tk.StringVar(value=self.cfg.email_from)
+        self.var_email_to = tk.StringVar(value=self.cfg.email_to)
 
-        self.chk_mail_enable = tb.Checkbutton(mail, text="", variable=self.var_mail_on, bootstyle="round-toggle")
-        self.chk_mail_enable.grid(row=0, column=0, sticky=W, pady=(0, 6))
-
-        self.lbl_mail_host = tb.Label(mail, text="")
-        self.lbl_mail_host.grid(row=1, column=0, sticky=W)
+        tb.Checkbutton(mail, text=self.i18n.t("mail_enable"), variable=self.var_mail_on, bootstyle="round-toggle").grid(row=0, column=0, sticky=W, pady=(0, 6))
+        tb.Label(mail, text="Host").grid(row=1, column=0, sticky=W)
         tb.Entry(mail, textvariable=self.var_smtp_host, width=36).grid(row=1, column=1, sticky=W, pady=2)
-
-        self.lbl_mail_port = tb.Label(mail, text="")
-        self.lbl_mail_port.grid(row=1, column=2, sticky=W)
+        tb.Label(mail, text="Port").grid(row=1, column=2, sticky=W)
         tb.Entry(mail, textvariable=self.var_smtp_port, width=8).grid(row=1, column=3, sticky=W, pady=2)
 
-        self.lbl_mail_user = tb.Label(mail, text="")
-        self.lbl_mail_user.grid(row=2, column=0, sticky=W)
+        tb.Label(mail, text="User").grid(row=2, column=0, sticky=W)
         tb.Entry(mail, textvariable=self.var_smtp_user, width=36).grid(row=2, column=1, sticky=W, pady=2)
 
-        self.lbl_mail_pass = tb.Label(mail, text="")
-        self.lbl_mail_pass.grid(row=3, column=0, sticky=W)
-        tb.Entry(mail, textvariable=self.var_smtp_pass, width=36, show="•").grid(row=3, column=1, sticky=W, pady=2)
+        tb.Label(mail, text="Pass").grid(row=3, column=0, sticky=W)
+        self.ent_smtp_pass = tb.Entry(mail, textvariable=self.var_smtp_pass, width=32, show="•")
+        self.ent_smtp_pass.grid(row=3, column=1, sticky=W, pady=2)
+        self._smtp_pass_hidden = True
 
-        self.lbl_mail_from = tb.Label(mail, text="")
-        self.lbl_mail_from.grid(row=4, column=0, sticky=W)
+        def toggle_smtp_pass():
+            self._smtp_pass_hidden = not self._smtp_pass_hidden
+            self.ent_smtp_pass.config(show=("•" if self._smtp_pass_hidden else ""))
+
+        tb.Button(mail, text="👁", width=3, bootstyle="secondary", command=toggle_smtp_pass).grid(row=3, column=2, sticky=W, padx=(6, 0))
+
+        tb.Label(mail, text="From").grid(row=4, column=0, sticky=W)
         tb.Entry(mail, textvariable=self.var_email_from, width=36).grid(row=4, column=1, sticky=W, pady=2)
-
-        self.lbl_mail_to = tb.Label(mail, text="")
-        self.lbl_mail_to.grid(row=5, column=0, sticky=W)
+        tb.Label(mail, text="To").grid(row=5, column=0, sticky=W)
         tb.Entry(mail, textvariable=self.var_email_to, width=36).grid(row=5, column=1, sticky=W, pady=2)
 
-        self.btn_mail_test = tb.Button(mail, text="Test", bootstyle="success", command=self.test_email)
-        self.btn_mail_test.grid(row=6, column=1, sticky=W, pady=(8, 0))
+        tb.Button(mail, text=self.i18n.t("mail_test"), bootstyle="success", command=self.test_email).grid(row=6, column=1, sticky=W, pady=(8, 0))
 
-        # dirty watchers
+        # mark dirty on edits
+        def _bind_dirty(var):
+            try:
+                var.trace_add("write", lambda *_: self.mark_dirty("dest"))
+            except Exception:
+                pass
+
         for v in [
             self.var_tg_on, self.var_tg_token, self.var_tg_chat,
+            self.var_dt_on, self.var_dt_webhook, self.var_dt_secret,
             self.var_mail_on, self.var_smtp_host, self.var_smtp_port,
             self.var_smtp_user, self.var_smtp_pass, self.var_email_from, self.var_email_to
         ]:
-            v.trace_add("write", self.mark_dirty)
+            _bind_dirty(v)
 
-    # ---------- Block ----------
-    def _build_tab_block(self):
-        content = self._tab_with_savebar(self.tab_block, self.on_save, "btn_block_save")
+        # per-page save
+        self.add_tab_save_bar(frm, "dest", self.save_dest_tab)
 
-        self.lbl_block_title = tb.Label(content, text="", font=("Segoe UI", 12, "bold"))
-        self.lbl_block_title.pack(anchor=W, pady=(0, 8))
+    def _build_filter(self):
+        frm = tb.Frame(self.tab_filter, padding=12)
+        frm.pack(fill=BOTH, expand=True)
 
-        self.var_block_ci = tk.BooleanVar(value=getattr(self.cfg, "block_case_insensitive", True))
-        self.chk_block_ci = tb.Checkbutton(content, text="", variable=self.var_block_ci, bootstyle="round-toggle")
-        self.chk_block_ci.pack(anchor=W, pady=(0, 10))
+        tb.Label(
+            frm,
+            text="Block keywords: if notification contains any of these, it will be ignored.",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor=W, pady=(0, 8))
 
-        self.lst_block = tk.Listbox(content, height=10)
+        self.var_block_ci = tk.BooleanVar(value=self.cfg.block_case_insensitive)
+        tb.Checkbutton(frm, text="Case-insensitive match", variable=self.var_block_ci, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+        self.var_block_ci.trace_add("write", lambda *_: self.mark_dirty("filter"))
+
+        self.lst_block = tk.Listbox(frm, height=10)
         self.lst_block.pack(fill=X, pady=(0, 10))
-        for k in (getattr(self.cfg, "block_keywords", []) or []):
+        for k in (self.cfg.block_keywords or []):
             self.lst_block.insert("end", k)
 
-        ctl = tb.Frame(content)
+        ctl = tb.Frame(frm)
         ctl.pack(fill=X)
 
         self.var_block_input = tk.StringVar()
         tb.Entry(ctl, textvariable=self.var_block_input, width=40).pack(side=LEFT, padx=(0, 8))
+        tb.Button(ctl, text=self.i18n.t("add"), bootstyle="secondary", command=self.add_block).pack(side=LEFT, padx=(0, 8))
+        tb.Button(ctl, text=self.i18n.t("remove_selected"), bootstyle="warning", command=self.remove_block).pack(side=LEFT)
 
-        self.btn_block_add = tb.Button(ctl, text="Add", bootstyle="secondary", command=self.add_block)
-        self.btn_block_add.pack(side=LEFT, padx=(0, 8))
+        # per-page save
+        self.add_tab_save_bar(frm, "filter", self.save_filter_tab)
 
-        self.btn_block_remove = tb.Button(ctl, text="Remove selected", bootstyle="warning", command=self.remove_block)
-        self.btn_block_remove.pack(side=LEFT)
+    def _build_misc(self):
+        frm = tb.Frame(self.tab_misc, padding=12)
+        frm.pack(fill=BOTH, expand=True)
 
-        self.var_block_ci.trace_add("write", self.mark_dirty)
+        tb.Label(frm, text=self.i18n.t("misc_title"), font=("Segoe UI", 12, "bold")).pack(anchor=W, pady=(0, 10))
 
-    # ---------- History ----------
-    def _build_tab_history(self):
-        content = tb.Frame(self.tab_history, padding=12)
-        content.pack(fill=BOTH, expand=True)
+        self.var_show_battery = tk.BooleanVar(value=getattr(self.cfg, "show_battery_in_message", True))
+        self.var_win_toast = tk.BooleanVar(value=getattr(self.cfg, "enable_windows_toast", True))
 
-        top = tb.Frame(content)
+        tb.Checkbutton(frm, text=self.i18n.t("show_battery_in_msg"), variable=self.var_show_battery, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+        tb.Checkbutton(frm, text=self.i18n.t("enable_windows_toast"), variable=self.var_win_toast, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+        tb.Label(frm, text=self.i18n.t("toast_note")).pack(anchor=W, pady=(10, 0))
+
+        self.var_show_battery.trace_add("write", lambda *_: self.mark_dirty("misc"))
+        self.var_win_toast.trace_add("write", lambda *_: self.mark_dirty("misc"))
+
+        # per-page save
+        self.add_tab_save_bar(frm, "misc", self.save_misc_tab)
+
+    def _build_history(self):
+        frm = tb.Frame(self.tab_history, padding=12)
+        frm.pack(fill=BOTH, expand=True)
+
+        top = tb.Frame(frm)
         top.pack(fill=X, pady=(0, 8))
+        tb.Label(top, text="Notification History", font=("Segoe UI", 12, "bold")).pack(side=LEFT)
+        tb.Button(top, text=self.i18n.t("clear"), bootstyle="warning", command=self.clear_history).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(top, text=self.i18n.t("copy_selected"), bootstyle="secondary", command=self.copy_selected_history).pack(side=RIGHT)
 
-        self.lbl_history_title = tb.Label(top, text="", font=("Segoe UI", 12, "bold"))
-        self.lbl_history_title.pack(side=LEFT)
-
-        self.btn_hist_clear = tb.Button(top, text="Clear", bootstyle="warning", command=self.clear_history)
-        self.btn_hist_clear.pack(side=RIGHT, padx=(8, 0))
-
-        self.btn_hist_copy = tb.Button(top, text="Copy selected", bootstyle="secondary", command=self.copy_selected_history)
-        self.btn_hist_copy.pack(side=RIGHT)
-
-        cols = ("time", "device", "app", "title", "msg", "codes")
-        self.tree = tb.Treeview(content, columns=cols, show="headings", height=18)
+        cols = ("time", "device", "battery", "app", "title", "msg", "codes")
+        self.tree = tb.Treeview(frm, columns=cols, show="headings", height=18)
         for c in cols:
             self.tree.heading(c, text=c)
-        self.tree.column("time", width=130, anchor=W)
-        self.tree.column("device", width=140, anchor=W)
-        self.tree.column("app", width=180, anchor=W)
-        self.tree.column("title", width=200, anchor=W)
+        self.tree.column("time", width=150, anchor=W)
+        self.tree.column("device", width=150, anchor=W)
+        self.tree.column("battery", width=80, anchor=W)
+        self.tree.column("app", width=220, anchor=W)
+        self.tree.column("title", width=220, anchor=W)
         self.tree.column("msg", width=320, anchor=W)
-        self.tree.column("codes", width=90, anchor=W)
+        self.tree.column("codes", width=140, anchor=W)
         self.tree.pack(fill=BOTH, expand=True)
 
-    # ---------- Logs ----------
-    def _build_tab_logs(self):
-        content = tb.Frame(self.tab_logs, padding=12)
-        content.pack(fill=BOTH, expand=True)
+    def _build_logs(self):
+        frm = tb.Frame(self.tab_logs, padding=12)
+        frm.pack(fill=BOTH, expand=True)
 
-        top = tb.Frame(content)
+        top = tb.Frame(frm)
         top.pack(fill=X, pady=(0, 8))
+        tb.Label(top, text="Compact logs (debug)", font=("Segoe UI", 12, "bold")).pack(side=LEFT)
+        tb.Button(top, text=self.i18n.t("clear"), bootstyle="warning", command=self.clear_logs).pack(side=RIGHT)
 
-        self.lbl_logs_title = tb.Label(top, text="", font=("Segoe UI", 12, "bold"))
-        self.lbl_logs_title.pack(side=LEFT)
-
-        self.btn_logs_clear = tb.Button(top, text="Clear", bootstyle="warning", command=self.clear_logs)
-        self.btn_logs_clear.pack(side=RIGHT)
-
-        self.txt_logs = tk.Text(content, wrap="word", height=10)
+        self.txt_logs = tk.Text(frm, wrap="word", height=10)
         self.txt_logs.pack(fill=BOTH, expand=True)
         self.txt_logs.insert("end", "Ready.\n")
 
-    # ---------- Language ----------
-    def on_change_language(self, _evt=None):
-        lang = (self.var_lang.get() or "en").lower()
-        if lang not in ("zh", "ja", "en"):
-            lang = "en"
-        if lang != self.ui_lang:
-            self.ui_lang = lang
-            self.mark_dirty()
-            self.apply_i18n()
-
-    # ---------- Core ----------
+    # ---------- Actions ----------
     def log(self, s: str):
         self.log_q.put(s)
 
     def on_notification(self, payload: dict):
-        preview_text = (
-            f"Device: {payload.get('device')}\n"
-            f"App: {payload.get('app')}\n"
-            f"Title: {payload.get('title')}\n"
-            f"Msg: {payload.get('msg')}\n"
-            f"Codes: {' '.join(payload.get('codes') or [])}\n"
-        )
+        bat = payload.get("battery")
+        bat_text = f"{bat}%" if isinstance(bat, int) else "--"
+
+        preview_lines = [
+            f"Device: {payload.get('device')}",
+            f"{self.i18n.t('battery')}: {bat_text}",
+            f"App: {payload.get('app')}",
+            f"Title: {payload.get('title')}",
+            f"Msg: {payload.get('msg')}",
+            f"Codes: {' '.join(payload.get('codes') or [])}",
+        ]
         self.preview.delete("1.0", "end")
-        self.preview.insert("end", preview_text)
+        self.preview.insert("end", "\n".join(preview_lines))
 
         self.history.append(payload)
-        limit = max(50, self.safe_int(self.var_history_limit.get(), getattr(self.cfg, "history_limit", 300)))
-        if len(self.history) > limit:
+        limit = int(self.safe_int(self.var_history_limit.get(), default=self.cfg.history_limit))
+        if len(self.history) > max(50, limit):
             self.history = self.history[-limit:]
 
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["ts"]))
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["ts"]))
         codes = " ".join(payload.get("codes") or [])
-        self.tree.insert("", "end", values=(ts, payload["device"], payload["app"], payload["title"], payload["msg"], codes))
+        self.tree.insert("", "end", values=(
+            t,
+            payload.get("device", ""),
+            bat_text,
+            payload.get("app", ""),
+            payload.get("title", ""),
+            payload.get("msg", ""),
+            codes
+        ))
 
         children = self.tree.get_children()
-        if len(children) > limit:
+        if len(children) > max(50, limit):
             for iid in children[: len(children) - limit]:
                 self.tree.delete(iid)
 
-    def _validate_before_run(self, cfg: BridgeConfig) -> bool:
-        if getattr(cfg, "enable_telegram", False):
-            tok = (getattr(cfg, "telegram_bot_token", "") or "").strip()
-            if not tok or tok.upper().startswith("PASTE_") or ":" not in tok:
-                messagebox.showerror(
-                    t(self.ui_lang, "msg_missing_title"),
-                    t(self.ui_lang, "msg_tg_invalid").format(prefix=tok[:12], path=CONFIG_PATH),
-                )
-                return False
-        return True
-
     def on_save(self):
         cfg = self.collect_config()
-        self.save_config(cfg)
-        self.set_dirty(False)
+        save_config(CONFIG_PATH, cfg)
+        self.cfg = cfg
+        self.manager.cfg = cfg
+        # 主保存：顺带清所有页面 dirty
+        for k in list(self.dirty.keys()):
+            self.clear_dirty(k)
+        messagebox.showinfo(self.i18n.t("ok"), f"{self.i18n.t('saved_to')}\n{CONFIG_PATH}")
 
     def on_start(self):
         if self.running:
             return
         cfg = self.collect_config()
-        if not self._validate_before_run(cfg):
-            return
-
-        # Start implies save
-        self.save_config(cfg)
-        self.set_dirty(False)
-
+        save_config(CONFIG_PATH, cfg)
         self.cfg = cfg
         self.manager.cfg = cfg
 
-        addrs = getattr(cfg, "ble_addresses", []) or []
+        addrs = cfg.ble_addresses or []
         if not addrs:
-            messagebox.showwarning(t(self.ui_lang, "msg_missing_title"), t(self.ui_lang, "msg_no_devices"))
+            messagebox.showwarning(self.i18n.t("missing"), "Add at least one address in Devices tab.")
             return
 
         self.running = True
-        self.lbl_status.config(text=t(self.ui_lang, "running"), bootstyle="success")
+        self.lbl_status.config(text=self.i18n.t("running"), bootstyle="success")
         self.manager.start_all(addrs)
         self.log("[UI] started")
 
@@ -570,11 +517,10 @@ class App(tb.Window):
         if not self.running:
             return
         self.running = False
-        self.lbl_status.config(text=t(self.ui_lang, "stopped"), bootstyle="danger")
+        self.lbl_status.config(text=self.i18n.t("stopped"), bootstyle="danger")
         self.manager.stop_all()
         self.log("[UI] stopped")
 
-    # ---------- Devices ----------
     def scan_devices(self):
         self.scan_box.delete("1.0", "end")
         self.scan_box.insert("end", "Scanning...\n")
@@ -583,8 +529,7 @@ class App(tb.Window):
             try:
                 results = asyncio_run(self.manager.scan_heart_rate(timeout=8))
                 if not results:
-                    self.log("[SCAN] none")
-                    self.scan_box.insert("end", t(self.ui_lang, "devices_no_found") + "\n")
+                    self.scan_box.insert("end", "No Heart Rate devices found.\n")
                     return
                 for name, addr, rssi in results:
                     self.scan_box.insert("end", f"{name} | addr={addr} | rssi={rssi}\n")
@@ -594,43 +539,41 @@ class App(tb.Window):
         threading.Thread(target=_work, daemon=True).start()
 
     def add_addr(self):
-        addr = (self.var_add_addr.get() or "").strip()
+        addr = self.var_add_addr.get().strip()
         if not addr:
             return
         existing = [self.lst_addr.get(i) for i in range(self.lst_addr.size())]
         if addr not in existing:
             self.lst_addr.insert("end", addr)
-            self.mark_dirty()
+            self.mark_dirty("devices")
         self.var_add_addr.set("")
 
     def remove_selected_addr(self):
         sel = list(self.lst_addr.curselection())
+        sel.reverse()
         if not sel:
             return
-        sel.reverse()
         for idx in sel:
             self.lst_addr.delete(idx)
-        self.mark_dirty()
+        self.mark_dirty("devices")
 
-    # ---------- Block ----------
     def add_block(self):
-        s = (self.var_block_input.get() or "").strip()
+        s = self.var_block_input.get().strip()
         if not s:
             return
         self.lst_block.insert("end", s)
         self.var_block_input.set("")
-        self.mark_dirty()
+        self.mark_dirty("filter")
 
     def remove_block(self):
         sel = list(self.lst_block.curselection())
+        sel.reverse()
         if not sel:
             return
-        sel.reverse()
         for idx in sel:
             self.lst_block.delete(idx)
-        self.mark_dirty()
+        self.mark_dirty("filter")
 
-    # ---------- History ----------
     def clear_history(self):
         self.history.clear()
         for iid in self.tree.get_children():
@@ -647,82 +590,58 @@ class App(tb.Window):
         text = "\n".join(lines)
         self.clipboard_clear()
         self.clipboard_append(text)
-        messagebox.showinfo(t(self.ui_lang, "msg_saved_title"), t(self.ui_lang, "msg_copied"))
+        messagebox.showinfo(self.i18n.t("ok"), "Copied")
 
-    # ---------- Logs ----------
     def clear_logs(self):
         self.txt_logs.delete("1.0", "end")
 
     # ---------- Tests ----------
     def test_telegram(self):
-        token = (self.var_tg_token.get() or "").strip()
-        chat_id = (self.var_tg_chat.get() or "").strip()
+        token = self.var_tg_token.get().strip()
+        chat_id = self.var_tg_chat.get().strip()
         if not token or not chat_id:
-            messagebox.showwarning(t(self.ui_lang, "msg_missing_title"), t(self.ui_lang, "msg_missing_tg"))
+            messagebox.showwarning(self.i18n.t("missing"), "Fill Telegram token & chat_id")
             return
         try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {"chat_id": chat_id, "text": "✅ Telegram Test: NekoLink OK", "disable_web_page_preview": True}
-            r = requests.post(url, json=payload, timeout=10)
-            r.raise_for_status()
-            messagebox.showinfo("OK", t(self.ui_lang, "msg_tg_ok"))
+            send_telegram(token, chat_id, "✅ Telegram Test: NekoLink OK")
+            messagebox.showinfo(self.i18n.t("ok"), "Telegram test sent")
         except Exception as e:
-            messagebox.showerror("Fail", f"Telegram failed: {e}")
+            messagebox.showerror(self.i18n.t("fail"), f"Telegram failed: {e}")
+
+    def test_dingtalk(self):
+        webhook = self.var_dt_webhook.get().strip()
+        secret = self.var_dt_secret.get().strip()
+        if not webhook:
+            messagebox.showwarning(self.i18n.t("missing"), "Fill DingTalk webhook")
+            return
+        try:
+            send_dingtalk_text(webhook, secret, "✅ DingTalk Test: NekoLink OK")
+            messagebox.showinfo(self.i18n.t("ok"), "DingTalk test sent")
+        except Exception as e:
+            messagebox.showerror(self.i18n.t("fail"), f"DingTalk failed: {e}")
 
     def test_email(self):
         cfg = self.collect_config()
         try:
-            import smtplib
-            from email.mime.text import MIMEText
-            msg = MIMEText("✅ Email Test: NekoLink OK", _charset="utf-8")
-            msg["Subject"] = "NekoLink Email Test"
-            msg["From"] = getattr(cfg, "email_from", "")
-            msg["To"] = getattr(cfg, "email_to", "")
-
-            server = smtplib.SMTP(getattr(cfg, "smtp_host", ""), int(getattr(cfg, "smtp_port", 587)), timeout=10)
-            server.ehlo()
-            server.starttls()
-            server.login(getattr(cfg, "smtp_user", ""), getattr(cfg, "smtp_pass", ""))
-            server.send_message(msg)
-            server.quit()
-            messagebox.showinfo("OK", t(self.ui_lang, "msg_email_ok"))
+            send_email(cfg, "NekoLink Email Test", "✅ Email Test: NekoLink OK")
+            messagebox.showinfo(self.i18n.t("ok"), "Email test sent")
         except Exception as e:
-            messagebox.showerror("Fail", f"Email failed: {e}")
+            messagebox.showerror(self.i18n.t("fail"), f"Email failed: {e}")
 
-    # ---------- Token visibility ----------
-    def toggle_token_visibility(self):
-        self._token_hidden = not self._token_hidden
-        self.ent_token.configure(show="•" if self._token_hidden else "")
-
-    # ---------- Tray / window behavior ----------
-    def on_close_minimize(self):
-        # remember current state (normal/zoomed)
-        try:
-            st = self.state()
-            if st in ("zoomed", "normal"):
-                self._restore_state = st
-        except Exception:
-            self._restore_state = "normal"
-
-        self.iconify()
-        self.log("[UI] minimized")
+    # ---------- Tray behavior ----------
+    def on_close_to_tray(self):
+        self.withdraw()
+        self.log("[UI] minimized to tray")
 
     def restore_from_tray(self):
-        # tray callback is not Tk main thread
-        self.after(0, self._restore_ui)
-
-    def _restore_ui(self):
         try:
             self.deiconify()
-
-            st = getattr(self, "_restore_state", "normal")
-            if st not in ("zoomed", "normal"):
-                st = "normal"
-            self.state(st)
-
+            # 防止“最大化弹回/状态异常”
+            try:
+                self.state("normal")
+            except Exception:
+                pass
             self.lift()
-            self.attributes("-topmost", True)
-            self.attributes("-topmost", False)
             self.focus_force()
         except Exception:
             pass
@@ -738,49 +657,30 @@ class App(tb.Window):
             pass
         self.destroy()
 
-    # ---------- Config IO ----------
-    def load_config(self) -> BridgeConfig:
-        self.ui_lang = "zh"
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                d = json.load(f)
-
-            self.ui_lang = (d.get("ui_lang") or "zh").lower()
-            if self.ui_lang not in ("zh", "ja", "en"):
-                self.ui_lang = "en"
-            self.var_lang = tk.StringVar(value=self.ui_lang)
-
-            if BRIDGE_FIELDS:
-                bd = {k: v for k, v in d.items() if k in BRIDGE_FIELDS}
-            else:
-                bd = d
-            return BridgeConfig(**bd)
-        except Exception:
-            self.ui_lang = "zh"
-            return BridgeConfig()
-
+    # ---------- Config ----------
     def collect_config(self) -> BridgeConfig:
         addrs = [self.lst_addr.get(i).strip() for i in range(self.lst_addr.size()) if self.lst_addr.get(i).strip()]
         blocks = [self.lst_block.get(i).strip() for i in range(self.lst_block.size()) if self.lst_block.get(i).strip()]
-
-        code_regex = getattr(self.cfg, "code_regex", r"\b\d{4,8}\b")
-        code_prefix = getattr(self.cfg, "code_separate_prefix", "🔑 Code")
 
         return BridgeConfig(
             ble_addresses=addrs,
             auto_pick_heart_rate=False,
 
             enable_telegram=bool(self.var_tg_on.get()),
-            telegram_bot_token=(self.var_tg_token.get() or "").strip(),
-            telegram_chat_id=(self.var_tg_chat.get() or "").strip(),
+            telegram_bot_token=self.var_tg_token.get().strip(),
+            telegram_chat_id=self.var_tg_chat.get().strip(),
+
+            enable_dingtalk=bool(self.var_dt_on.get()),
+            dingtalk_webhook=self.var_dt_webhook.get().strip(),
+            dingtalk_secret=self.var_dt_secret.get().strip(),
 
             enable_email=bool(self.var_mail_on.get()),
-            smtp_host=(self.var_smtp_host.get() or "").strip(),
+            smtp_host=self.var_smtp_host.get().strip(),
             smtp_port=self.safe_int(self.var_smtp_port.get(), 587),
-            smtp_user=(self.var_smtp_user.get() or "").strip(),
-            smtp_pass=(self.var_smtp_pass.get() or "").strip(),
-            email_to=(self.var_email_to.get() or "").strip(),
-            email_from=(self.var_email_from.get() or "").strip(),
+            smtp_user=self.var_smtp_user.get().strip(),
+            smtp_pass=self.var_smtp_pass.get().strip(),
+            email_to=self.var_email_to.get().strip(),
+            email_from=self.var_email_from.get().strip(),
 
             dedup_seconds=self.safe_int(self.var_dedup.get(), 8),
 
@@ -789,27 +689,14 @@ class App(tb.Window):
 
             enable_code_highlight=bool(self.var_code_on.get()),
             code_send_separately=bool(self.var_code_sep.get()),
-            code_regex=code_regex,
-            code_separate_prefix=code_prefix,
+            code_regex=self.cfg.code_regex,
+            code_separate_prefix=self.cfg.code_separate_prefix,
 
-            history_limit=self.safe_int(self.var_history_limit.get(), getattr(self.cfg, "history_limit", 300)),
-            autostart_enabled=getattr(self.cfg, "autostart_enabled", False),
-        )
+            history_limit=self.safe_int(self.var_history_limit.get(), self.cfg.history_limit),
+            autostart_enabled=self.cfg.autostart_enabled,
 
-    def save_config(self, cfg: BridgeConfig):
-        data = dict(cfg.__dict__)
-        data["ui_lang"] = self.ui_lang
-
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            back = json.load(f)
-
-        tok = (back.get("telegram_bot_token") or "")
-        messagebox.showinfo(
-            t(self.ui_lang, "msg_saved_title"),
-            t(self.ui_lang, "msg_saved_body").format(path=os.path.abspath(CONFIG_PATH), prefix=tok[:12]),
+            show_battery_in_message=bool(self.var_show_battery.get()),
+            enable_windows_toast=bool(self.var_win_toast.get()),
         )
 
     @staticmethod
@@ -818,6 +705,23 @@ class App(tb.Window):
             return int(str(v).strip())
         except Exception:
             return default
+
+    # ---------- i18n ----------
+    def on_change_lang(self):
+        lang = self.var_lang.get().strip()
+        self.i18n.set_lang(lang)
+        self.title(self.i18n.t("app_title"))
+
+        self.nb.tab(self.tab_main, text=self.i18n.t("main"))
+        self.nb.tab(self.tab_devices, text=self.i18n.t("devices"))
+        self.nb.tab(self.tab_dest, text=self.i18n.t("dest"))
+        self.nb.tab(self.tab_filter, text=self.i18n.t("filter"))
+        self.nb.tab(self.tab_misc, text=self.i18n.t("misc"))
+        self.nb.tab(self.tab_history, text=self.i18n.t("history"))
+        self.nb.tab(self.tab_logs, text=self.i18n.t("logs"))
+
+        self.lbl_cfg.config(text=f"{self.i18n.t('config_path')}: {CONFIG_PATH}")
+        self.lbl_status.config(text=self.i18n.t("running") if self.running else self.i18n.t("stopped"))
 
     # ---------- Log pump ----------
     def _flush_logs(self):

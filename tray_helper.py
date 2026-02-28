@@ -1,43 +1,31 @@
+# tray_helper.py
+# -*- coding: utf-8 -*-
 import threading
+import os
+from PIL import Image
 import pystray
-from PIL import Image, ImageDraw
 
-def _make_icon_image(size=64):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    # simple round icon
-    d.ellipse((8, 8, size-8, size-8), fill=(60, 130, 255, 255))
-    d.text((size//2-10, size//2-12), "N", fill=(255,255,255,255))
-    return img
 
 class TrayController:
-    """
-    - close window -> hide to tray
-    - tray menu -> restore / exit
-    """
-    def __init__(self, title: str, on_restore, on_exit):
+    def __init__(self, title, on_restore, on_exit, icon_path=None):
         self.title = title
         self.on_restore = on_restore
         self.on_exit = on_exit
+        self.icon_path = icon_path
 
         self.icon = None
-        self._thread = None
+        self.thread = None
+
+    # ----------------------------
+    # Public API
+    # ----------------------------
 
     def start(self):
-        if self.icon:
+        if self.thread and self.thread.is_alive():
             return
-        image = _make_icon_image()
-        menu = pystray.Menu(
-            pystray.MenuItem("Restore", lambda: self.on_restore()),
-            pystray.MenuItem("Exit", lambda: self.on_exit()),
-        )
-        self.icon = pystray.Icon(self.title, image, self.title, menu)
 
-        def _run():
-            self.icon.run()
-
-        self._thread = threading.Thread(target=_run, daemon=True)
-        self._thread.start()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
     def stop(self):
         if self.icon:
@@ -45,4 +33,51 @@ class TrayController:
                 self.icon.stop()
             except Exception:
                 pass
-            self.icon = None
+
+    # ----------------------------
+    # Internal
+    # ----------------------------
+
+    def _run(self):
+        image = self._load_icon()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Restore", self._restore),
+            pystray.MenuItem("Exit", self._exit)
+        )
+
+        self.icon = pystray.Icon(
+            self.title,
+            image,
+            self.title,
+            menu
+        )
+
+        # 关键：用默认 run，不搞私有 listener
+        self.icon.run()
+
+    def _restore(self, icon, item):
+        try:
+            self.on_restore()
+        except Exception:
+            pass
+
+    def _exit(self, icon, item):
+        try:
+            self.on_exit()
+        finally:
+            icon.stop()
+
+    def _load_icon(self):
+        if self.icon_path and os.path.exists(self.icon_path):
+            try:
+                return Image.open(self.icon_path)
+            except Exception:
+                pass
+
+        # fallback 简单图标
+        from PIL import ImageDraw
+        img = Image.new("RGB", (64, 64), color=(40, 120, 200))
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 18), "N", fill="white")
+        return img
